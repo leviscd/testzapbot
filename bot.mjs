@@ -1,21 +1,22 @@
 /**
- * bot.mjs — bot Baileys 7 em um único arquivo
- *   • login por pairing code (8 caracteres)
- *   • comandos do Código 1 (menu por enquete, figurinhas, moderação, etc.)
- *   • NÃO encaminha nenhum log pro WhatsApp
- *   • sharp carregado sob demanda (não quebra o boot se faltar)
+ * bot.mjs - bot Baileys 7 em um unico arquivo
+ *   - login por pairing code (8 caracteres)
+ *   - comandos do Codigo 1 (menu por enquete, figurinhas, moderacao, etc.)
+ *   - NAO encaminha nenhum log pro WhatsApp
+ *   - sharp carregado sob demanda (nao quebra o boot se faltar)
+ *   - codigo-fonte 100% ASCII: emojis/acentos via \u{...}, sem depender de encoding
  *
  * Rodar:  node bot.mjs      (Node >= 20)
  * Env:
- *   PAIR_CODE     pairing code customizado, exatamente 8 chars (padrão: aleatório)
- *   PREFIX        prefixo dos comandos (padrão: ?)
- *   AUTH_DIR      pasta da sessão (padrão: ./auth)
+ *   PAIR_CODE     pairing code customizado, exatamente 8 chars (padrao: aleatorio)
+ *   PREFIX        prefixo dos comandos (padrao: ?)
+ *   AUTH_DIR      pasta da sessao (padrao: ./auth)
  *   PORT          se definido, abre um HTTP "ok" (hospedagens que exigem porta)
- *   BAILEYS_LOG   error | warn | info | debug | trace (padrão: warn)
- *   WATCHDOG_MS   watchdog de conexão (padrão: 60000)
+ *   BAILEYS_LOG   error | warn | info | debug | trace (padrao: warn)
+ *   WATCHDOG_MS   watchdog de conexao (padrao: 60000)
  *   ENABLE_EVAL   "true" habilita ?execute / ?exec / ?eval (owner only)
- *   OWNER_JIDS    lista separada por vírgulas de JIDs do(s) dono(s)
- *   BOT_NO_START  se definido, não inicia automaticamente (para testes)
+ *   OWNER_JIDS    lista separada por virgulas de JIDs do(s) dono(s)
+ *   BOT_NO_START  se definido, nao inicia automaticamente (para testes)
  */
 import makeWASocket, {
   useMultiFileAuthState,
@@ -28,7 +29,7 @@ import makeWASocket, {
 import fs from 'node:fs';
 import http from 'node:http';
 
-/* ═════════════════════════ config ═════════════════════════ */
+/* ============================ config ============================ */
 const PREFIX = process.env.PREFIX || '?';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const PAIR_CODE = (process.env.PAIR_CODE || '').toUpperCase() || undefined;
@@ -41,16 +42,16 @@ const OWNER_JIDS = new Set(
     .filter(Boolean)
 );
 
-/* ═════════════════════════ número fixo do bot ═════════════════════════ */
-const PAIR_NUMBER = '5562996664760'; // mostra o código direto no console
+/* ==================== numero fixo do bot ==================== */
+const PAIR_NUMBER = '5562996664760';
 
-/* ═════════════════════════ estado ═════════════════════════ */
+/* ============================ estado ============================ */
 let activeSock = null;
 const setActiveSock = (s) => { activeSock = s; };
 
-const sentCache = new Map();      // id → message (retry / eco do próprio bot)
-const messageStore = new Map();   // id → message (reconstruir enquete)
-const menuSessions = new Map();   // chave da enquete → sessão do menu
+const sentCache = new Map();      // id -> message (retry / eco do proprio bot)
+const messageStore = new Map();   // id -> message (reconstruir enquete)
+const menuSessions = new Map();   // chave da enquete -> sessao do menu
 
 function rememberSent(msg) {
   const id = msg?.key?.id;
@@ -59,7 +60,31 @@ function rememberSent(msg) {
   if (sentCache.size > 500) sentCache.delete(sentCache.keys().next().value);
 }
 
-/* ═════════════════════════ logger do Baileys ═════════════════════════ */
+/* ==================== emojis como escapes unicode ==================== */
+// O arquivo-fonte e ASCII puro. Estes sao os mesmos caracteres que apareciam
+// nos textos originais - em runtime ficam identicos.
+const E = {
+  camera:  '\u{1F4F8}',           // camera
+  police:  '\u{1F46E}',           // policial
+  tools:   '\u{1F6E0}\u{FE0F}',   // ferramentas
+  info:    '\u{2139}\u{FE0F}',    // info
+  picture: '\u{1F5BC}\u{FE0F}',   // quadro
+  robot:   '\u{1F916}',           // robo
+  users:   '\u{1F465}',           // pessoas
+  bolt:    '\u{26A1}',            // raio
+  trash:   '\u{1F5D1}\u{FE0F}',   // lixeira
+  up:      '\u{2B06}\u{FE0F}',    // seta pra cima
+  down:    '\u{2B07}\u{FE0F}',    // seta pra baixo
+  point:   '\u{261D}\u{FE0F}',    // dedinho pra cima
+  x:       '\u{274C}',            // X vermelho
+  ping:    '\u{1F3D3}',           // ping-pong
+  clock:   '\u{23F1}\u{FE0F}',    // cronometro
+  lock:    '\u{1F510}',           // cadeado
+  no:      '\u{26D4}',            // proibido
+  ok:      '\u{2705}',            // check verde
+};
+
+/* ==================== logger do Baileys ==================== */
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
 const BA_LEVEL = LEVELS[process.env.BAILEYS_LOG] !== undefined ? process.env.BAILEYS_LOG : 'warn';
 const BA_MAX = LEVELS[BA_LEVEL];
@@ -69,17 +94,17 @@ function safeString(v, max = 500) {
     const s = typeof v === 'string' ? v : JSON.stringify(v, (_k, val) => {
       if (typeof val === 'bigint') return val.toString();
       if (val instanceof Error) return { name: val.name, message: val.message };
-      if (val instanceof Uint8Array) return `<${val.length} bytes>`;
+      if (val instanceof Uint8Array) return '<' + val.length + ' bytes>';
       return val;
     });
-    return s && s.length > max ? s.slice(0, max) + '…' : s;
+    return s && s.length > max ? s.slice(0, max) + '...' : s;
   } catch { return String(v); }
 }
 
 function makeLogger() {
   const emit = (lvl, a, b) => {
     if (LEVELS[lvl] > BA_MAX) return;
-    const parts = [`[baileys]`, b || ''].filter(Boolean);
+    const parts = ['[baileys]', b || ''].filter(Boolean);
     if (a !== undefined && a !== null) {
       parts.push(a instanceof Error ? (a.stack || a.message) : safeString(a));
     }
@@ -98,7 +123,7 @@ function makeLogger() {
   return lg;
 }
 
-/* ═════════════════════════ utilitários ═════════════════════════ */
+/* ==================== utilitarios ==================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const normalizeJid = (jid) => String(jid || '').replace(/:.*/, '').trim().toLowerCase();
 const isGroup = (jid) => jid?.endsWith('@g.us') ?? false;
@@ -150,62 +175,66 @@ async function reply(sock, jid, message, content) {
 }
 
 async function replyError(sock, jid, message, error) {
-  return reply(sock, jid, message, { text: `❌ Erro:owner ${error?.message || error}` });
+  return reply(sock, jid, message, { text: E.x + ' Erro: ' + (error?.message || error) });
 }
 
-/* ═════)
-════════════════════ textos  do menu ═════════════════════ execute════ */
-const MENU_OPTIONS = ['📸 Figuras', '👮 Moderação', '🛠️ Utilitários', 'ℹ️ Sobre'];
+/* ==================== textos do menu ==================== */
+const MENU_OPTIONS = [
+  E.camera + ' Figuras',
+  E.police + ' Modera\u00E7\u00E3o',
+  E.tools  + ' Utilit\u00E1rios',
+  E.info   + ' Sobre',
+];
 
 const MENU_RESPONSES = {
-  '📸 Figuras': () =>
-    `*🖼️ MENU FIGURAS*\n\n` +
-    `${PREFIX}s     - Responda uma imagem para converter em figurinha\n` +
-    `${PREFIX}sticker - Alias de ${PREFIX}s\n` +
-    `${PREFIX}fig   - Alias de ${PREFIX}s\n` +
-    `${PREFIX}img   - Responda uma figurinha para converter em imagem\n` +
-    `${PREFIX}toimg - Alias de ${PREFIX}img\n` +
-    `${PREFIX}imagem - Alias de ${PREFIX}img`,
+  [E.camera + ' Figuras']: () =>
+    '*' + E.picture + ' MENU FIGURAS*\n\n' +
+    PREFIX + 's       - Responda uma imagem para converter em figurinha\n' +
+    PREFIX + 'sticker - Alias de ' + PREFIX + 's\n' +
+    PREFIX + 'fig     - Alias de ' + PREFIX + 's\n' +
+    PREFIX + 'img     - Responda uma figurinha para converter em imagem\n' +
+    PREFIX + 'toimg   - Alias de ' + PREFIX + 'img\n' +
+    PREFIX + 'imagem  - Alias de ' + PREFIX + 'img',
 
-  '👮 Moderação': () =>
-    `*👮 MENU MODERAÇÃO* (apenas admins do grupo)\n\n` +
-    `${PREFIX}ban @user     - Remove um membro do grupo\n` +
-    `${PREFIX}promote @user - Promove um membro a administrador\n` +
-    `${PREFIX}demote @user  - Remove um membro de administrador`,
+  [E.police + ' Modera\u00E7\u00E3o']: () =>
+    '*' + E.police + ' MENU MODERA\u00C7\u00C3O* (apenas admins do grupo)\n\n' +
+    PREFIX + 'ban @user     - Remove um membro do grupo\n' +
+    PREFIX + 'promote @user - Promove um membro a administrador\n' +
+    PREFIX + 'demote @user  - Remove um membro de administrador',
 
-  '🛠️ Utilitários': () =>
-    `*🛠️ MENU UTILITÁRIOS*\n\n` +
-    `${PREFIX}menu   - Mostra este menu\n` +
-    `${PREFIX}help   - Alias de ${PREFIX}menu\n` +
-    `${PREFIX}ping   - Verifica se o bot está online\n` +
-    `${PREFIX}uptime - Mostra o tempo de atividade\n` +
-    `${PREFIX}info   - Informações da mensagem respondida\n` +
-    `${PREFIX}execute <code> - Executa JS (owner, se habilitado)\n` +
-    `${PREFIX}exec   - Alias de ${PREFIX}execute\n` +
-    `${PREFIX}eval   - Alias de ${PREFIX}execute`,
+  [E.tools + ' Utilit\u00E1rios']: () =>
+    '*' + E.tools + ' MENU UTILIT\u00C1RIOS*\n\n' +
+    PREFIX + 'menu    - Mostra este menu\n' +
+    PREFIX + 'help    - Alias de ' + PREFIX + 'menu\n' +
+    PREFIX + 'ping    - Verifica se o bot esta online\n' +
+    PREFIX + 'uptime  - Mostra o tempo de atividade\n' +
+    PREFIX + 'info    - Informacoes da mensagem respondida\n' +
+    PREFIX + 'execute <code> - Executa JS (owner, se habilitado)\n' +
+    PREFIX + 'exec    - Alias de ' + PREFIX + 'execute\n' +
+    PREFIX + 'eval    - Alias de ' + PREFIX + 'execute',
 
-  'ℹ️ Sobre': () =>
-    `*ℹ️ SOBRE O BOT*\n\n` +
-    `🤖 SyntraxBot v1.1\n` +
-    `Bot de WhatsApp usando Baileys\n` +
-    `👥 Suporte a grupos e privados\n` +
-    `⚡ Comandos: ${PREFIX}menu\n\n` +
-    `Prefix: ${PREFIX}`,
+  [E.info + ' Sobre']: () =>
+    '*' + E.info + ' SOBRE O BOT*\n\n' +
+    E.robot + ' SyntraxBot v1.1\n' +
+    'Bot de WhatsApp usando Baileys\n' +
+    E.users + ' Suporte a grupos e privados\n' +
+    E.bolt + ' Comandos: ' + PREFIX + 'menu\n\n' +
+    'Prefix: ' + PREFIX,
 };
 
 const GROUP_ACTION_LABELS = {
-  remove: '🗑️ Membro removido do grupo!',
-  promote: '⬆️ Usuário promovido a administrador!',
-  demote: '⬇️ Administrador rebaixado.',
+  remove:  E.trash + ' Membro removido do grupo!',
+  promote: E.up + ' Usu\u00E1rio promovido a administrador!',
+  demote:  E.down + ' Administrador rebaixado.',
 };
 
-/* ═════════════════════════ enquete / menu ═════════════════════════ */
+/* ==================== enquete / menu ==================== */
 function getPollUpdate(message) {
   return unwrap(message).pollUpdateMessage || null;
 }
 
 function pollKeyStr(key) {
-  return key ? `${key.remoteJid}:${key.id}` : '';
+  return key ? key.remoteJid + ':' + key.id : '';
 }
 
 function getPollCreationKey(update) {
@@ -225,7 +254,7 @@ async function sendMenu(sock, jid, sender) {
 
   const response = await sock.sendMessage(
     jid,
-    { text: '*Selecione uma categoria acima ☝️*' },
+    { text: '*Selecione uma categoria acima ' + E.point + '*' },
     { quoted: poll }
   );
   rememberSent(response);
@@ -274,16 +303,16 @@ async function handleMenuPoll(sock, message) {
   return true;
 }
 
-/* ═════════════════════════ sharp (lazy) ═════════════════════════ */
+/* ==================== sharp (lazy) ==================== */
 let sharpPromise = null;
 function getSharp() {
   if (!sharpPromise) {
     sharpPromise = import('sharp')
       .then((m) => m.default || m)
       .catch((e) => {
-        sharpPromise = null; // permite tentar de novo depois
+        sharpPromise = null;
         throw new Error(
-          'sharp não está disponível neste ambiente — adicione "sharp" nas dependências. Detalhe: ' +
+          'sharp nao esta disponivel neste ambiente - adicione "sharp" nas dependencias. Detalhe: ' +
             (e?.message || e)
         );
       });
@@ -291,7 +320,7 @@ function getSharp() {
   return sharpPromise;
 }
 
-/* ═════════════════════════ conversão de mídia ═════════════════════════ */
+/* ==================== conversao de midia ==================== */
 async function downloadAsBuffer(mediaMessage, mediaType) {
   const stream = await downloadContentFromMessage(mediaMessage, mediaType);
   const chunks = [];
@@ -303,13 +332,13 @@ async function stickerToImage(sock, message, jid) {
   try {
     const sticker = unwrap(message).stickerMessage;
     if (!sticker) {
-      await reply(sock, jid, message, { text: `Responda uma figurinha com ${PREFIX}img` });
+      await reply(sock, jid, message, { text: 'Responda uma figurinha com ' + PREFIX + 'img' });
       return;
     }
     const sharp = await getSharp();
     const buf = await downloadAsBuffer(sticker, 'image');
     const image = await sharp(buf).png().toBuffer();
-    await reply(sock, jid, message, { image, caption: '🖼️ Sua imagem' });
+    await reply(sock, jid, message, { image, caption: E.picture + ' Sua imagem' });
   } catch (error) {
     console.error('stickerToImage:', error?.stack || error);
     await replyError(sock, jid, message, error);
@@ -320,7 +349,7 @@ async function imageToSticker(sock, message, jid) {
   try {
     const image = unwrap(message).imageMessage;
     if (!image) {
-      await reply(sock, jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
+      await reply(sock, jid, message, { text: 'Responda uma imagem com ' + PREFIX + 's' });
       return;
     }
     const sharp = await getSharp();
@@ -336,7 +365,7 @@ async function imageToSticker(sock, message, jid) {
   }
 }
 
-/* ═════════════════════════ comandos de grupo ═════════════════════════ */
+/* ==================== comandos de grupo ==================== */
 async function getGroupInfo(sock, jid, sender) {
   const metadata = await sock.groupMetadata(jid);
   const senderParticipant = metadata.participants.find(
@@ -361,7 +390,7 @@ function mentionedJidsOf(message) {
 
 async function handleGroupAction(sock, jid, sender, action, message) {
   if (!isGroup(jid)) {
-    await reply(sock, jid, message, { text: 'Este comando só funciona em grupos.' });
+    await reply(sock, jid, message, { text: 'Este comando so funciona em grupos.' });
     return;
   }
 
@@ -369,27 +398,27 @@ async function handleGroupAction(sock, jid, sender, action, message) {
 
   if (!group.isAdmin) {
     await reply(sock, jid, message, {
-      text: '👮 Apenas administradores podem usar este comando.',
+      text: E.police + ' Apenas administradores podem usar este comando.',
     });
     return;
   }
   if (!group.isBotAdmin) {
     await reply(sock, jid, message, {
-      text: '🤖 Eu preciso ser administrador do grupo para isso.',
+      text: E.robot + ' Eu preciso ser administrador do grupo para isso.',
     });
     return;
   }
 
   const mentions = mentionedJidsOf(message);
   if (!mentions.length) {
-    await reply(sock, jid, message, { text: `Use: ${PREFIX}${action} @usuario` });
+    await reply(sock, jid, message, { text: 'Use: ' + PREFIX + action + ' @usuario' });
     return;
   }
 
   try {
     await sock.groupParticipantsUpdate(jid, [mentions[0]], action);
     await reply(sock, jid, message, {
-      text: GROUP_ACTION_LABELS[action] || 'Ação realizada!',
+      text: GROUP_ACTION_LABELS[action] || 'Acao realizada!',
     });
   } catch (error) {
     console.error('handleGroupAction:', error?.stack || error);
@@ -397,7 +426,7 @@ async function handleGroupAction(sock, jid, sender, action, message) {
   }
 }
 
-/* ═════════════════════════ info da mensagem ═════════════════════════ */
+/* ==================== info da mensagem ==================== */
 async function sendMessageInfo(sock, jid, message) {
   try {
     const content = unwrap(message);
@@ -423,20 +452,20 @@ async function sendMessageInfo(sock, jid, message) {
   }
 }
 
-/* ═════════════════════════ execução de código (owner) ═════════════════════════ */
+/* ==================== execucao de codigo (owner) ==================== */
 async function executeCode(sock, jid, sender, code, message) {
   if (!ENABLE_EVAL) {
-    await reply(sock, jid, message, { text: '⛔ Execução de código está desativada.' });
+    await reply(sock, jid, message, { text: E.no + ' Execucao de codigo esta desativada.' });
     return;
   }
   if (!isOwner(sender)) {
     await reply(sock, jid, message, {
-      text: '🔐 Apenas o proprietário pode executar código.',
+      text: E.lock + ' Apenas o proprietario pode executar codigo.',
     });
     return;
   }
   if (!code.trim()) {
-    await reply(sock, jid, message, { text: `Uso: ${PREFIX}execute <código JavaScript>` });
+    await reply(sock, jid, message, { text: 'Uso: ' + PREFIX + 'execute <codigo JavaScript>' });
     return;
   }
 
@@ -447,12 +476,12 @@ async function executeCode(sock, jid, sender, code, message) {
       'sender',
       'msg',
       'sleep',
-      `return (async () => {\n${code}\n})()`
+      'return (async () => {\n' + code + '\n})()'
     )(sock, jid, sender, message, sleep);
 
     const output =
       result === undefined
-        ? '✅ Executado sem retorno'
+        ? E.ok + ' Executado sem retorno'
         : typeof result === 'string'
           ? result
           : JSON.stringify(result, null, 2);
@@ -466,52 +495,43 @@ async function executeCode(sock, jid, sender, code, message) {
   }
 }
 
-/* ═════════════════════════ tabela de comandos ═════════════════════════ */
+/* ==================== tabela de comandos ==================== */
 const COMMAND_HANDLERS = {
-  // menu
   menu: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
   help: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
 
-  // utilitários
-  ping: ({ sock, jid, message }) => reply(sock, jid, message, { text: '🏓 Pong!' }),
+  ping: ({ sock, jid, message }) => reply(sock, jid, message, { text: E.ping + ' Pong!' }),
 
   uptime: ({ sock, jid, message }) => {
     const u = Math.floor(process.uptime());
     const h = Math.floor(u / 3600);
     const m = Math.floor((u % 3600) / 60);
     const s = u % 60;
-    return reply(sock, jid, message, { text: `⏱️ Bot ativo há ${h}h ${m}m ${s}s` });
+    return reply(sock, jid, message, {
+      text: E.clock + ' Bot ativo ha ' + h + 'h ' + m + 'm ' + s + 's',
+    });
   },
 
   info: ({ sock, jid, message }) => sendMessageInfo(sock, jid, message),
 
-  // figuras: imagem → figurinha
-  s: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
+  s:       ({ sock, jid, message }) => imageToSticker(sock, message, jid),
   sticker: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
-  fig: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
+  fig:     ({ sock, jid, message }) => imageToSticker(sock, message, jid),
 
-  // figuras: figurinha → imagem
-  img: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
-  toimg: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
+  img:    ({ sock, jid, message }) => stickerToImage(sock, message, jid),
+  toimg:  ({ sock, jid, message }) => stickerToImage(sock, message, jid),
   imagem: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
 
-  // moderação (grupo)
-  ban: ({ sock, jid, sender, message }) =>
-    handleGroupAction(sock, jid, sender, 'remove', message),
-  promote: ({ sock, jid, sender, message }) =>
-    handleGroupAction(sock, jid, sender, 'promote', message),
-  demote: ({ sock, jid, sender, message }) =>
-    handleGroupAction(sock, jid, sender, 'demote', message),
+  ban:     ({ sock, jid, sender, message }) => handleGroupAction(sock, jid, sender, 'remove', message),
+  promote: ({ sock, jid, sender, message }) => handleGroupAction(sock, jid, sender, 'promote', message),
+  demote:  ({ sock, jid, sender, message }) => handleGroupAction(sock, jid, sender, 'demote', message),
 
-  // execução (: ({ sock, jid, sender, body, message }) =>
-    executeCode(sock, jid, sender, body, message),
-  exec: ({ sock, jid, sender, body, message }) =>
-    executeCode(sock, jid, sender, body, message),
-  eval: ({ sock, jid, sender, body, message }) =>
-    executeCode(sock, jid, sender, body, message),
+  execute: ({ sock, jid, sender, body, message }) => executeCode(sock, jid, sender, body, message),
+  exec:    ({ sock, jid, sender, body, message }) => executeCode(sock, jid, sender, body, message),
+  eval:    ({ sock, jid, sender, body, message }) => executeCode(sock, jid, sender, body, message),
 };
 
-/* ═════════════════════════ handler de mensagem ═════════════════════════ */
+/* ==================== handler de mensagem ==================== */
 async function onMessage(sock, m) {
   if (!m?.message || !m.key?.remoteJid) return;
   const jid = m.key.remoteJid;
@@ -519,11 +539,10 @@ async function onMessage(sock, m) {
   if (m.key.id && sentCache.has(m.key.id)) return;
 
   const ts = Number(m.messageTimestamp);
-  if (ts && Date.now() / 1000 - ts > 90) return; // ignora fila offline antiga
+  if (ts && Date.now() / 1000 - ts > 90) return;
 
   storeMessage(m);
 
-  // Enquete: tratamos ANTES de descartar fromMe (o voto chega como recebido)
   if (getPollUpdate(m)) {
     try {
       await handleMenuPoll(sock, m);
@@ -547,7 +566,7 @@ async function onMessage(sock, m) {
   const handler = COMMAND_HANDLERS[command];
   if (!handler) {
     await reply(sock, jid, m, {
-      text: `❌ Comando não encontrado. Use ${PREFIX}menu para ver as opções.`,
+      text: E.x + ' Comando nao encontrado. Use ' + PREFIX + 'menu para ver as opcoes.',
     });
     return;
   }
@@ -555,14 +574,14 @@ async function onMessage(sock, m) {
   try {
     await handler({ sock, jid, sender, message: m, args, body });
   } catch (error) {
-    console.error(`erro no comando ${PREFIX}${command}:`, error?.stack || error);
+    console.error('erro no comando ' + PREFIX + command + ':', error?.stack || error);
     await reply(sock, jid, m, {
-      text: `❌ Erro ao processar comando: ${String(error?.message || error).slice(0, 100)}`,
+      text: E.x + ' Erro ao processar comando: ' + String(error?.message || error).slice(0, 100),
     });
   }
 }
 
-/* ═════════════════════════ conexão + pairing code ═════════════════════════ */
+/* ==================== conexao + pairing code ==================== */
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
@@ -570,7 +589,7 @@ async function start() {
   try {
     version = (await fetchLatestBaileysVersion()).version;
   } catch (e) {
-    console.warn('não consegui buscar a versão mais recente do WA, usando a padrão:', e?.message);
+    console.warn('nao consegui buscar a versao mais recente do WA, usando a padrao:', e?.message);
   }
 
   const sock = makeWASocket({
@@ -586,13 +605,13 @@ async function start() {
   setActiveSock(sock);
   sock.ev.on('creds.update', saveCreds);
 
-  // Watchdog: se a hospedagem bloqueia saída/DNS, o Baileys pode ficar mudo.
   let reached = false;
   let closedSeen = false;
   const watchdog = setTimeout(() => {
     if (reached) return;
     console.error(
-      `[watchdog] ${WATCHDOG_MS / 1000}s sem conseguir falar com o WhatsApp (hospedagem bloqueando saida? DNS? firewall?). Tentando de novo...`
+      '[watchdog] ' + (WATCHDOG_MS / 1000) + 's sem conseguir falar com o WhatsApp ' +
+      '(hospedagem bloqueando saida? DNS? firewall?). Tentando de novo...'
     );
     try { sock.end(new Error('watchdog: sem conexao')); }
     catch (e) { console.error('sock.end falhou:', e?.message); }
@@ -607,17 +626,17 @@ async function start() {
       const code = await sock.requestPairingCode(PAIR_NUMBER, PAIR_CODE);
       const pretty = code.match(/.{1,4}/g).join('-');
       console.log(
-        `\n==========================================\n` +
-        `   NUMERO: ${PAIR_NUMBER}\n` +
-        `   CODIGO DE PAREAMENTO:  ${pretty}\n` +
-        `   WhatsApp > Aparelhos conectados > Conectar\n` +
-        `   aparelho > Conectar com numero de telefone\n` +
-        `==========================================\n`
+        '\n==========================================\n' +
+        '   NUMERO: ' + PAIR_NUMBER + '\n' +
+        '   CODIGO DE PAREAMENTO:  ' + pretty + '\n' +
+        '   WhatsApp > Aparelhos conectados > Conectar\n' +
+        '   aparelho > Conectar com numero de telefone\n' +
+        '==========================================\n'
       );
     } catch (e) {
       pairingRequested = false;
       const short = String(e?.stack || e).split('\n').slice(0, 3).join(' | ');
-      console.error(`falha ao pedir o pairing code: ${short}`);
+      console.error('falha ao pedir o pairing code: ' + short);
     }
   };
   if (!sock.authState.creds.registered) setTimeout(askPairing, 8000).unref();
@@ -629,11 +648,11 @@ async function start() {
       clearTimeout(watchdog);
     }
     if (qr) askPairing();
-    if (connection) console.log(`connection.update -> ${connection}`);
+    if (connection) console.log('connection.update -> ' + connection);
 
     if (connection === 'open') {
-      console.log(`CONECTADO como ${sock.user?.id}${sock.user?.lid ? ` (lid ${sock.user.lid})` : ''}`);
-      console.log(`Mande ${PREFIX}menu pra este numero (ou pra voce mesmo, em "Conversar comigo").`);
+      console.log('CONECTADO como ' + sock.user?.id + (sock.user?.lid ? ' (lid ' + sock.user.lid + ')' : ''));
+      console.log('Mande ' + PREFIX + 'menu pra este numero (ou pra voce mesmo, em "Conversar comigo").');
     }
 
     if (connection === 'close') {
@@ -642,7 +661,7 @@ async function start() {
       if (activeSock === sock) setActiveSock(null);
       const err = lastDisconnect?.error;
       const code = err?.output?.statusCode;
-      console.error(`CONEXAO FECHADA: code=${code} (${DisconnectReason[code] ?? 'desconhecido'}) — ${err?.message}`);
+      console.error('CONEXAO FECHADA: code=' + code + ' (' + (DisconnectReason[code] ?? 'desconhecido') + ') - ' + err?.message);
 
       if (code === DisconnectReason.loggedOut) {
         console.error('Sessao deslogada: apagando a pasta de sessao e pareando de novo.');
@@ -675,16 +694,16 @@ function boot() {
   });
 }
 
-/* ═════════════════════════ HTTP health (opcional) ═════════════════════════ */
+/* ==================== HTTP health (opcional) ==================== */
 if (process.env.PORT) {
   http
     .createServer((_q, r) => r.end('bot ok'))
-    .listen(process.env.PORT, () => console.log(`http na porta ${process.env.PORT}`));
+    .listen(process.env.PORT, () => console.log('http na porta ' + process.env.PORT));
 }
 
 if (!process.env.BOT_NO_START) boot();
 
-// exportado só pra testes offline
+// exportado so pra testes offline
 export {
   start,
   boot,
