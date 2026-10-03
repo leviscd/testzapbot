@@ -1,184 +1,57 @@
 /**
- * bot.mjs — bot de TESTE (Baileys 7) em um único arquivo
+ * bot.mjs — bot Baileys 7 em um único arquivo
  *   • login por pairing code (8 caracteres)
- *   • ?testbutton → manda 5 variações de botão pra você ver quais aparecem no celular
- *   • todo console.log/warn/error, logs do Baileys e o XML das mensagens de teste
- *     são encaminhados pro PRÓPRIO número do bot ("Conversar comigo")
+ *   • comandos baseados no Código 1 (menu por enquete, figurinhas, moderação etc.)
+ *   • NÃO encaminha nenhum log pro WhatsApp
  *
  * Rodar:  PAIR_NUMBER=5562999999999 node bot.mjs      (Node >= 20)
- * Env opcionais:
- *   PAIR_NUMBER  número do bot com DDI+DDD+9 (só dígitos). Sem isso o bot pergunta no console
- *   PAIR_CODE    pairing code customizado, exatamente 8 chars (padrão: aleatório)
- *   PREFIX       prefixo dos comandos (padrão: ?)
- *   LOG_TO_WA    0 = não encaminha logs pro WhatsApp (padrão: 1)
- *   BAILEYS_LOG  error | warn | info — nível dos logs do Baileys (padrão: info)
- *   AUTH_DIR     pasta da sessão (padrão: ./auth)
- *   PORT         se definido, abre um HTTP "ok" (hospedagens que exigem porta)
+ * Env:
+ *   PAIR_NUMBER   número do bot com DDI+DDD+9 (só dígitos). Sem isso o bot pergunta no console
+ *   PAIR_CODE     pairing code customizado, exatamente 8 chars (padrão: aleatório)
+ *   PREFIX        prefixo dos comandos (padrão: ?)
+ *   AUTH_DIR      pasta da sessão (padrão: ./auth)
+ *   PORT          se definido, abre um HTTP "ok" (hospedagens que exigem porta)
+ *   BAILEYS_LOG   error | warn | info | debug | trace (padrão: warn)
+ *   WATCHDOG_MS   watchdog de conexão (padrão: 60000)
+ *   ENABLE_EVAL   "true" habilita ?execute / ?exec / ?eval (owner only)
+ *   OWNER_JIDS    lista separada por vírgulas de JIDs do(s) dono(s)
+ *   BOT_NO_START  se definido, não inicia automaticamente (para testes)
  */
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
   fetchLatestBaileysVersion,
-  generateWAMessageFromContent,
-  generateMessageIDV2,
-  jidNormalizedUser,
-  isJidGroup,
-  normalizeMessageContent,
-  delay,
+  downloadContentFromMessage,
+  getAggregateVotesInPollMessage,
 } from '@whiskeysockets/baileys';
-import { format } from 'node:util';
 import fs from 'node:fs';
 import http from 'node:http';
 import readline from 'node:readline/promises';
+import sharp from 'sharp';
 
 /* ═════════════════════════ config ═════════════════════════ */
 const PREFIX = process.env.PREFIX || '?';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const PAIR_CODE = (process.env.PAIR_CODE || '').toUpperCase() || undefined;
-const LOG_TO_WA = process.env.LOG_TO_WA !== '0';
-const BAILEYS_LOG = ['error', 'warn', 'info'].includes(process.env.BAILEYS_LOG) ? process.env.BAILEYS_LOG : 'info';
-const LOG_MARK = '📟'; // toda mensagem de log começa com isso (o bot ignora ela mesma)
-const CHUNK = 3000; // tamanho máx. de cada mensagem de log
-const MAX_LOG_MSGS_PER_MIN = 10; // trava anti-flood / anti-ban
-const WATCHDOG_MS = Number(process.env.WATCHDOG_MS) || 60_000; // sem falar com o WA nesse tempo = avisa e tenta de novo
+const WATCHDOG_MS = Number(process.env.WATCHDOG_MS) || 60_000;
+const ENABLE_EVAL = process.env.ENABLE_EVAL === 'true';
+const OWNER_JIDS = new Set(
+  (process.env.OWNER_JIDS || '')
+    .split(',')
+    .map((j) => j.trim())
+    .filter(Boolean)
+);
 let pairNumber = (process.env.PAIR_NUMBER || '').replace(/\D/g, '');
 
-/* ═════════ 1. captura de console → fila → WhatsApp ═════════ */
-const origConsole = { log: console.log, info: console.info, warn: console.warn, error: console.error };
-const logQueue = [];
-let droppedLines = 0;
-let activeSock = null; // socket conectado (null enquanto offline)
-let pauseFlush = false;
-let flushing = false;
-const sendTimes = [];
-
+/* ═════════════════════════ estado ═════════════════════════ */
+let activeSock = null;
 const setActiveSock = (s) => { activeSock = s; };
 
-function pushLog(level, text) {
-  const t = new Date().toISOString().slice(11, 19);
-  const tag = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : '•';
-  logQueue.push(`${t} ${tag} ${String(text).replaceAll('```', "'''")}`);
-  if (logQueue.length > 400) { logQueue.shift(); droppedLines++; }
-}
+const sentCache = new Map();      // id → message (para o Baileys pedir em retry / eco)
+const messageStore = new Map();   // id → message (para reconstruir a enquete)
+const menuSessions = new Map();   // chave da enquete → sessão do menu
 
-for (const lvl of ['log', 'info', 'warn', 'error']) {
-  console[lvl] = (...args) => {
-    origConsole[lvl](...args);
-    if (LOG_TO_WA) pushLog(lvl, format(...args));
-  };
-}
-
-function chunkLines(lines, max) {
-  const out = [];
-  let cur = '';
-  for (let l of lines) {
-    if (l.length > max) l = l.slice(0, max - 20) + '…[cortado]';
-    if (cur && cur.length + l.length + 1 > max) { out.push(cur); cur = l; }
-    else cur = cur ? cur + '\n' + l : l;
-  }
-  if (cur) out.push(cur);
-  return out;
-}
-
-async function flushLogs() {
-  if (flushing || pauseFlush || !activeSock || !logQueue.length) return;
-  const now = Date.now();
-  while (sendTimes.length && now - sendTimes[0] > 60_000) sendTimes.shift();
-  if (sendTimes.length >= MAX_LOG_MSGS_PER_MIN) return; // espera esfriar (a fila continua acumulando)
-  flushing = true;
-  const sock = activeSock;
-  try {
-    const lines = logQueue.splice(0);
-    if (droppedLines) { lines.unshift(`… ${droppedLines} linha(s) descartada(s) (fila cheia)`); droppedLines = 0; }
-    const chunks = chunkLines(lines, CHUNK);
-    const me = jidNormalizedUser(sock.user.id);
-    for (const c of chunks.slice(0, 4)) {
-      sendTimes.push(Date.now());
-      const sent = await sock.sendMessage(me, { text: `${LOG_MARK} \`\`\`${c}\`\`\`` });
-      rememberSent(sent);
-      await delay(600);
-    }
-    if (chunks.length > 4) droppedLines += chunks.length - 4;
-  } catch (e) {
-    origConsole.error('[forwarder] falha ao mandar logs pro WhatsApp:', e?.message || e); // só no console, sem re-encaminhar
-  } finally {
-    flushing = false;
-  }
-}
-setInterval(() => flushLogs().catch(() => {}), 2500).unref();
-
-process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.stack || e));
-process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e?.stack || e));
-
-/* ═════════ 2. logger do Baileys (captura erros e o XML) ═════════ */
-// O Baileys só gera o XML quando logger.level === 'trace', então declaramos 'trace'
-// e filtramos aqui: só mostramos XML das mensagens de teste (ids em watchIds).
-const watchIds = new Set();
-
-function safe(v, max = 1200) {
-  const seen = new WeakSet();
-  let s;
-  try {
-    s = JSON.stringify(v, (_k, val) => {
-      if (typeof val === 'bigint') return val.toString();
-      if (val instanceof Error) {
-        return { name: val.name, message: val.message, status: val.output?.statusCode, data: val.data, stack: val.stack?.split('\n').slice(0, 4).join(' | ') };
-      }
-      if (val instanceof Uint8Array) return `<${val.length} bytes>`;
-      if (val?.type === 'Buffer' && Array.isArray(val.data)) return `<${val.data.length} bytes>`;
-      if (val && typeof val === 'object') { if (seen.has(val)) return '[circular]'; seen.add(val); }
-      return val;
-    });
-  } catch { s = String(v); }
-  return s && s.length > max ? s.slice(0, max) + '…' : s;
-}
-
-/** tira o hex gigante do <enc> pra o <biz> não ser cortado (ele fica no FIM do stanza) */
-function compactXml(xml, max = 2200) {
-  let s = String(xml)
-    .replace(/^([ \t]*)([0-9a-f]{48,})[ \t]*$/gim, (_m, ind, hex) => `${ind}‹${hex.length >> 1} bytes›`)
-    .replace(/^\t+/gm, (t) => '  '.repeat(Math.max(1, t.length >> 1)))
-    .replace(/<([\w:-]+) >/g, '<$1>');
-  if (s.length > max) s = s.slice(0, max >> 1) + '\n…[cortado]…\n' + s.slice(-(max >> 1));
-  return s;
-}
-
-const LEVEL_RANK = { error: 0, warn: 1, info: 2 };
-function fromBaileys(level, obj, msg) {
-  if (LEVEL_RANK[level] > LEVEL_RANK[BAILEYS_LOG]) return;
-  let body;
-  if (obj instanceof Error) body = obj.stack || obj.message;
-  else if (typeof obj === 'string') body = obj;
-  else if (obj !== undefined) body = safe(obj);
-  const text = [msg, body].filter(Boolean).join(' ');
-  console[level === 'info' ? 'log' : level](`[baileys] ${text}`);
-}
-
-function makeLogger() {
-  const lg = {
-    level: 'trace',
-    child: () => lg,
-    trace(obj) {
-      const xml = obj?.xml;
-      if (typeof xml !== 'string' || !watchIds.size) return;
-      for (const id of watchIds) {
-        if (xml.includes(id)) {
-          console.log(`XML ${obj.msg === 'xml send' ? '⬆ ENVIADO' : '⬇ RECEBIDO'}:\n${compactXml(xml)}`);
-          return;
-        }
-      }
-    },
-    debug() {},
-    info: (o, m) => fromBaileys('info', o, m),
-    warn: (o, m) => fromBaileys('warn', o, m),
-    error: (o, m) => fromBaileys('error', o, m),
-  };
-  return lg;
-}
-
-/* ═════════ 3. mensagens: cache p/ retry, texto, botões ═════════ */
-const sentCache = new Map(); // id → message (o Baileys pede via getMessage quando o celular pede reenvio)
 function rememberSent(msg) {
   const id = msg?.key?.id;
   if (!id || !msg.message) return;
@@ -186,168 +59,488 @@ function rememberSent(msg) {
   if (sentCache.size > 500) sentCache.delete(sentCache.keys().next().value);
 }
 
-async function sendText(sock, jid, text, quoted) {
-  const sent = await sock.sendMessage(jid, { text }, quoted ? { quoted } : undefined);
+/* ═════════════════════════ logger do Baileys ═════════════════════════ */
+const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
+const BA_LEVEL = LEVELS[process.env.BAILEYS_LOG] !== undefined ? process.env.BAILEYS_LOG : 'warn';
+const BA_MAX = LEVELS[BA_LEVEL];
+
+function safeString(v, max = 500) {
+  try {
+    const s = typeof v === 'string' ? v : JSON.stringify(v, (_k, val) => {
+      if (typeof val === 'bigint') return val.toString();
+      if (val instanceof Error) return { name: val.name, message: val.message };
+      if (val instanceof Uint8Array) return `<${val.length} bytes>`;
+      return val;
+    });
+    return s && s.length > max ? s.slice(0, max) + '…' : s;
+  } catch { return String(v); }
+}
+
+function makeLogger() {
+  const emit = (lvl, a, b) => {
+    if (LEVELS[lvl] > BA_MAX) return;
+    const parts = [`[baileys]`, b || ''].filter(Boolean);
+    if (a !== undefined && a !== null) {
+      parts.push(a instanceof Error ? (a.stack || a.message) : safeString(a));
+    }
+    const fn = lvl === 'error' ? console.error : lvl === 'warn' ? console.warn : console.log;
+    fn(...parts);
+  };
+  const lg = {
+    level: 'trace',
+    child: () => lg,
+    trace: (o, m) => emit('trace', o, m),
+    debug: (o, m) => emit('debug', o, m),
+    info:  (o, m) => emit('info',  o, m),
+    warn:  (o, m) => emit('warn',  o, m),
+    error: (o, m) => emit('error', o, m),
+  };
+  return lg;
+}
+
+/* ═════════════════════════ utilitários ═════════════════════════ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const normalizeJid = (jid) => String(jid || '').replace(/:.*/, '').trim().toLowerCase();
+const isGroup = (jid) => jid?.endsWith('@g.us') ?? false;
+const isOwner = (jid) => OWNER_JIDS.has(normalizeJid(jid));
+
+function unwrap(message) {
+  let content = message?.message;
+  while (content) {
+    const wrapper =
+      content.ephemeralMessage ||
+      content.viewOnceMessage ||
+      content.viewOnceMessageV2 ||
+      content.documentWithCaptionMessage;
+    if (!wrapper?.message) break;
+    content = wrapper.message;
+  }
+  return content || {};
+}
+
+function textOf(message) {
+  const c = unwrap(message);
+  return (
+    c.conversation ||
+    c.extendedTextMessage?.text ||
+    c.imageMessage?.caption ||
+    c.videoMessage?.caption ||
+    c.documentMessage?.caption ||
+    c.buttonsResponseMessage?.selectedButtonId ||
+    c.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    c.templateButtonReplyMessage?.selectedId ||
+    ''
+  ).trim();
+}
+
+function senderOf(message) {
+  return message.key.participant || message.key.remoteJid || '';
+}
+
+function storeMessage(message) {
+  if (!message?.key?.id) return;
+  messageStore.set(message.key.id, message);
+  if (messageStore.size > 1000) messageStore.delete(messageStore.keys().next().value);
+}
+
+async function reply(sock, jid, message, content) {
+  const sent = await sock.sendMessage(jid, content, { quoted: message });
   rememberSent(sent);
   return sent;
 }
 
-const btn = (name, params) => ({ name, buttonParamsJson: JSON.stringify(params) });
-const quickReply = (text, id = text) => btn('quick_reply', { display_text: String(text), id: String(id) });
-
-/** nós que o Baileys não anexa sozinho e que o app mobile exige */
-function buildNodes({ isGroup, bot }) {
-  const nodes = [{
-    tag: 'biz',
-    attrs: {},
-    content: [{
-      tag: 'interactive',
-      attrs: { type: 'native_flow', v: '1' },
-      content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' } }],
-    }],
-  }];
-  if (bot && !isGroup) nodes.push({ tag: 'bot', attrs: { biz_bot: '1' } });
-  return nodes;
+async function replyError(sock, jid, message, error) {
+  return reply(sock, jid, message, { text: `❌ Erro: ${error?.message || error}` });
 }
 
-/**
- * opts.bot (true)       anexa <bot biz_bot="1"/> em chat privado
- * opts.viewOnce (false) embrulha em viewOnceMessage
- * opts.nodes (true)     false = NÃO anexa <biz> (grupo de controle)
- */
-async function sendInteractive(sock, jid, content, opts = {}) {
-  const { body, footer, header, buttons } = content || {};
-  if (!Array.isArray(buttons) || !buttons.length) throw new Error('sendInteractive: "buttons" precisa ser array não vazio');
-  const { bot = true, viewOnce = false, nodes = true, quoted } = opts;
+/* ═════════════════════════ textos do menu ═════════════════════════ */
+const MENU_OPTIONS = ['📸 Figuras', '👮 Moderação', '🛠️ Utilitários', 'ℹ️ Sobre'];
 
-  const interactiveMessage = {
-    body: { text: String(body ?? '') },
-    ...(footer ? { footer: { text: String(footer) } } : {}),
-    ...(header ? { header: { title: String(header), hasMediaAttachment: false } } : {}),
-    nativeFlowMessage: { buttons, messageParamsJson: '' },
-  };
-  const inner = {
-    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
-    interactiveMessage,
-  };
+const MENU_RESPONSES = {
+  '📸 Figuras': () =>
+    `*🖼️ MENU FIGURAS*\n\n${PREFIX}s - Responda uma figurinha para converter em imagem\n${PREFIX}img - Responda uma imagem para converter em figurinha\n${PREFIX}fig - Alias de figurinha`,
+  '👮 Moderação': () =>
+    `*👮 MENU MODERAÇÃO* (Apenas admins)\n\n${PREFIX}ban @user - Remove um membro\n${PREFIX}promote @user - Promove a administrador\n${PREFIX}demote @user - Remove de administrador`,
+  '🛠️ Utilitários': () =>
+    `*🛠️ MENU UTILITÁRIOS*\n\n${PREFIX}ping - Verifica se o bot está online\n${PREFIX}uptime - Mostra tempo de atividade\n${PREFIX}info - Informações da mensagem`,
+  'ℹ️ Sobre': () =>
+    `*ℹ️ SOBRE O BOT*\n\n🤖 SyntraxBot v1.1\nBot de WhatsApp usando Baileys\n👥 Suporte a grupos e privados\n⚡ Comandos: ${PREFIX}menu\n\nPrefix: ${PREFIX}`,
+};
 
-  const id = generateMessageIDV2(sock.user?.id);
-  watchIds.add(id); // registra ANTES de enviar, pra capturar o XML de saída
-  setTimeout(() => watchIds.delete(id), 120_000).unref();
+const GROUP_ACTION_LABELS = {
+  remove: '🗑️ Membro removido do grupo!',
+  promote: '⬆️ Usuário promovido a administrador!',
+  demote: '⬇️ Administrador rebaixado.',
+};
 
-  const msg = generateWAMessageFromContent(
+/* ═════════════════════════ enquete / menu ═════════════════════════ */
+function getPollUpdate(message) {
+  return unwrap(message).pollUpdateMessage || null;
+}
+
+function pollKeyStr(key) {
+  return key ? `${key.remoteJid}:${key.id}` : '';
+}
+
+function getPollCreationKey(update) {
+  return update?.pollCreationMessageKey || update?.pollCreationMessage?.key || null;
+}
+
+async function sendMenu(sock, jid, sender) {
+  const poll = await sock.sendMessage(jid, {
+    poll: {
+      name: 'Menu SyntraxBot',
+      values: MENU_OPTIONS,
+      selectableCount: 1,
+    },
+  });
+  rememberSent(poll);
+  if (poll?.key?.id) messageStore.set(poll.key.id, poll);
+
+  const response = await sock.sendMessage(
     jid,
-    viewOnce ? { viewOnceMessage: { message: inner } } : inner,
-    { userJid: sock.user.id, messageId: id, quoted },
+    { text: '*Selecione uma categoria acima ☝️*' },
+    { quoted: poll }
   );
-  const additionalNodes = nodes ? buildNodes({ isGroup: isJidGroup(jid), bot }) : [];
-  rememberSent(msg);
-  await sock.relayMessage(jid, msg.message, { messageId: id, additionalNodes });
-  return msg;
+  rememberSent(response);
+
+  if (poll?.key?.id && response?.key?.id) {
+    menuSessions.set(pollKeyStr(poll.key), {
+      jid,
+      sender: normalizeJid(sender),
+      responseKey: response.key,
+      pollKey: poll.key,
+      createdAt: Date.now(),
+    });
+  }
 }
 
-const getText = (c) =>
-  c.conversation || c.extendedTextMessage?.text || c.imageMessage?.caption || c.videoMessage?.caption || '';
+async function handleMenuPoll(sock, message) {
+  const update = getPollUpdate(message);
+  if (!update) return false;
 
-function getInteractiveReply(c) {
-  const nf = c.interactiveResponseMessage?.nativeFlowResponseMessage;
-  if (!nf?.paramsJson) return null;
-  try { return JSON.parse(nf.paramsJson); } catch { return { raw: nf.paramsJson }; }
+  const pollKey = getPollCreationKey(update);
+  if (!pollKey) return false;
+
+  const session = menuSessions.get(pollKeyStr(pollKey));
+  if (!session) return true;
+
+  const voter = update.voterJid || message.key.participant || message.key.remoteJid;
+  if (normalizeJid(voter) !== session.sender) return true;
+
+  const votes = getAggregateVotesInPollMessage({
+    message: messageStore.get(pollKey.id),
+    pollUpdates: [message],
+  });
+
+  const selected = MENU_OPTIONS.find((option) => votes?.[option]?.length > 0);
+  if (!selected) return true;
+
+  try {
+    await sock.sendMessage(session.jid, {
+      text: MENU_RESPONSES[selected](),
+      edit: session.responseKey,
+    });
+  } catch (e) {
+    console.error('erro ao editar resposta do menu:', e?.message || e);
+  }
+  menuSessions.delete(pollKeyStr(pollKey));
+  return true;
 }
 
-/* ═════════ 4. comandos ═════════ */
-const VARIANTS = [
-  { key: '0', label: 'CONTROLE sem <biz> (esperado: só na Web)', opts: { nodes: false } },
-  { key: 'A', label: 'biz + bot (padrão)', opts: {} },
-  { key: 'B', label: 'biz sem bot', opts: { bot: false } },
-  { key: 'C', label: 'viewOnce + biz + bot', opts: { viewOnce: true } },
-  { key: 'D', label: 'viewOnce + biz sem bot', opts: { viewOnce: true, bot: false } },
-];
+/* ═════════════════════════ conversão de mídia ═════════════════════════ */
+async function downloadAsBuffer(mediaMessage, mediaType) {
+  const stream = await downloadContentFromMessage(mediaMessage, mediaType);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
+async function stickerToImage(sock, message, jid) {
+  try {
+    const sticker = unwrap(message).stickerMessage;
+    if (!sticker) {
+      await reply(sock, jid, message, { text: `Responda uma figurinha com ${PREFIX}img` });
+      return;
+    }
+    const buf = await downloadAsBuffer(sticker, 'image');
+    const image = await sharp(buf).png().toBuffer();
+    await reply(sock, jid, message, { image, caption: '🖼️ Sua imagem' });
+  } catch (error) {
+    console.error('stickerToImage:', error?.stack || error);
+    await replyError(sock, jid, message, error);
+  }
+}
+
+async function imageToSticker(sock, message, jid) {
+  try {
+    const image = unwrap(message).imageMessage;
+    if (!image) {
+      await reply(sock, jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
+      return;
+    }
+    const buf = await downloadAsBuffer(image, 'image');
+    const webp = await sharp(buf)
+      .resize(512, 512, { fit: 'cover', withoutEnlargement: false })
+      .webp()
+      .toBuffer();
+    await reply(sock, jid, message, { sticker: webp });
+  } catch (error) {
+    console.error('imageToSticker:', error?.stack || error);
+    await replyError(sock, jid, message, error);
+  }
+}
+
+/* ═════════════════════════ comandos de grupo ═════════════════════════ */
+async function getGroupInfo(sock, jid, sender) {
+  const metadata = await sock.groupMetadata(jid);
+  const senderParticipant = metadata.participants.find(
+    (p) => normalizeJid(p.id) === normalizeJid(sender)
+  );
+  const botParticipant = metadata.participants.find(
+    (p) => normalizeJid(p.id) === normalizeJid(sock.user.id)
+  );
+  return {
+    jid,
+    isAdmin:
+      senderParticipant?.admin === 'admin' || senderParticipant?.admin === 'superadmin',
+    isBotAdmin:
+      botParticipant?.admin === 'admin' || botParticipant?.admin === 'superadmin',
+  };
+}
+
+function mentionedJidsOf(message) {
+  const c = unwrap(message);
+  return c.extendedTextMessage?.contextInfo?.mentionedJid || [];
+}
+
+async function handleGroupAction(sock, jid, sender, action, message) {
+  if (!isGroup(jid)) {
+    await reply(sock, jid, message, { text: 'Este comando só funciona em grupos.' });
+    return;
+  }
+
+  const group = await getGroupInfo(sock, jid, sender);
+
+  if (!group.isAdmin) {
+    await reply(sock, jid, message, {
+      text: '👮 Apenas administradores podem usar este comando.',
+    });
+    return;
+  }
+  if (!group.isBotAdmin) {
+    await reply(sock, jid, message, {
+      text: '🤖 Eu preciso ser administrador do grupo para isso.',
+    });
+    return;
+  }
+
+  const mentions = mentionedJidsOf(message);
+  if (!mentions.length) {
+    await reply(sock, jid, message, { text: `Use: ${PREFIX}${action} @usuario` });
+    return;
+  }
+
+  try {
+    await sock.groupParticipantsUpdate(jid, [mentions[0]], action);
+    await reply(sock, jid, message, {
+      text: GROUP_ACTION_LABELS[action] || 'Ação realizada!',
+    });
+  } catch (error) {
+    console.error('handleGroupAction:', error?.stack || error);
+    await replyError(sock, jid, message, error);
+  }
+}
+
+/* ═════════════════════════ info da mensagem ═════════════════════════ */
+async function sendMessageInfo(sock, jid, message) {
+  try {
+    const content = unwrap(message);
+    const info = {
+      remoteJid: message.key.remoteJid,
+      messageId: message.key.id,
+      timestamp: new Date(Number(message.messageTimestamp) * 1000),
+      fromMe: message.key.fromMe,
+      sender: senderOf(message),
+      text: textOf(message).slice(0, 100),
+      contentType: Object.keys(content)[0] || 'unknown',
+      hasMedia:
+        !!content.imageMessage || !!content.videoMessage || !!content.documentMessage,
+      isQuoted: !!content.extendedTextMessage?.contextInfo?.quotedMessage,
+      mentions: content.extendedTextMessage?.contextInfo?.mentionedJid || [],
+    };
+    const formatted = JSON.stringify(info, null, 2);
+    const output = formatted.length > 4096 ? formatted.slice(0, 4000) + '...' : formatted;
+    await reply(sock, jid, message, { text: '```\n' + output + '\n```' });
+  } catch (error) {
+    console.error('sendMessageInfo:', error?.stack || error);
+    await replyError(sock, jid, message, error);
+  }
+}
+
+/* ═════════════════════════ execução de código (owner) ═════════════════════════ */
+async function executeCode(sock, jid, sender, code, message) {
+  if (!ENABLE_EVAL) {
+    await reply(sock, jid, message, { text: '⛔ Execução de código está desativada.' });
+    return;
+  }
+  if (!isOwner(sender)) {
+    await reply(sock, jid, message, {
+      text: '🔐 Apenas o proprietário pode executar código.',
+    });
+    return;
+  }
+  if (!code.trim()) {
+    await reply(sock, jid, message, { text: `Uso: ${PREFIX}execute <código JavaScript>` });
+    return;
+  }
+
+  try {
+    const result = await new Function(
+      'socket',
+      'jid',
+      'sender',
+      'msg',
+      'sleep',
+      `return (async () => {\n${code}\n})()`
+    )(sock, jid, sender, message, sleep);
+
+    const output =
+      result === undefined
+        ? '✅ Executado sem retorno'
+        : typeof result === 'string'
+          ? result
+          : JSON.stringify(result, null, 2);
+
+    await reply(sock, jid, message, { text: '```\n' + output.slice(0, 4000) + '\n```' });
+  } catch (error) {
+    console.error('executeCode:', error?.stack || error);
+    await reply(sock, jid, message, {
+      text: '```\n' + String(error?.message || error).slice(0, 500) + '\n```',
+    });
+  }
+}
+
+/* ═════════════════════════ tabela de comandos ═════════════════════════ */
+const COMMAND_HANDLERS = {
+  menu: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
+  help: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
+
+  ping: ({ sock, jid, message }) => reply(sock, jid, message, { text: '🏓 Pong!' }),
+
+  uptime: ({ sock, jid, message }) => {
+    const u = Math.floor(process.uptime());
+    const h = Math.floor(u / 3600);
+    const m = Math.floor((u % 3600) / 60);
+    const s = u % 60;
+    return reply(sock, jid, message, { text: `⏱️ Bot ativo há ${h}h ${m}m ${s}s` });
+  },
+
+  info: ({ sock, jid, message }) => sendMessageInfo(sock, jid, message),
+
+  // "s"/"fig"/"sticker" → imagem → figurinha
+  s: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
+  sticker: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
+  fig: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
+
+  // "img"/"toimg"/"imagem" → figurinha → imagem
+  img: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
+  toimg: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
+  imagem: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
+
+  ban: ({ sock, jid, sender, message }) =>
+    handleGroupAction(sock, jid, sender, 'remove', message),
+  promote: ({ sock, jid, sender, message }) =>
+    handleGroupAction(sock, jid, sender, 'promote', message),
+  demote: ({ sock, jid, sender, message }) =>
+    handleGroupAction(sock, jid, sender, 'demote', message),
+
+  execute: ({ sock, jid, sender, body, message }) =>
+    executeCode(sock, jid, sender, body, message),
+  exec: ({ sock, jid, sender, body, message }) =>
+    executeCode(sock, jid, sender, body, message),
+  eval: ({ sock, jid, sender, body, message }) =>
+    executeCode(sock, jid, sender, body, message),
+};
+
+/* ═════════════════════════ handler de mensagem ═════════════════════════ */
 async function onMessage(sock, m) {
   if (!m?.message || !m.key?.remoteJid) return;
   const jid = m.key.remoteJid;
   if (jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
-  if (m.key.id && sentCache.has(m.key.id)) return; // eco do que o próprio bot mandou
+  if (m.key.id && sentCache.has(m.key.id)) return;
+
   const ts = Number(m.messageTimestamp);
-  if (ts && Date.now() / 1000 - ts > 90) return; // ignora mensagem velha (fila offline)
+  if (ts && Date.now() / 1000 - ts > 90) return; // ignora fila offline antiga
 
-  const content = normalizeMessageContent(m.message) || {};
-  const text = getText(content).trim();
-  if (text.startsWith(LOG_MARK)) return; // log nosso: não processa nem loga (evita loop)
+  storeMessage(m);
 
-  if (content.interactiveResponseMessage) {
-    const click = getInteractiveReply(content);
-    console.log('🔘 CLIQUE recebido:', safe(click));
-    await sendText(sock, jid, `✅ clique recebido! id=${click?.id ?? '(sem id)'}`, m);
+  // Enquete: tratamos ANTES de descartar fromMe, porque o voto chega como recebido
+  if (getPollUpdate(m)) {
+    try {
+      await handleMenuPoll(sock, m);
+    } catch (e) {
+      console.error('handleMenuPoll:', e?.stack || e);
+    }
     return;
   }
 
+  if (m.key.fromMe) return;
+
+  const text = textOf(m);
   if (!text.startsWith(PREFIX)) return;
-  const [cmd, ...args] = text.slice(PREFIX.length).trim().split(/\s+/);
-  console.log(`comando ${PREFIX}${cmd} de ${jid}`);
 
-  switch ((cmd || '').toLowerCase()) {
-    case 'ping':
-      await sendText(sock, jid, 'pong 🏓', m);
-      break;
+  const parts = text.slice(PREFIX.length).trim().split(/\s+/);
+  const command = (parts.shift() || '').toLowerCase();
+  const args = parts;
+  const body = args.join(' ');
+  const sender = senderOf(m);
 
-    case 'help':
-    case 'menu':
-      await sendText(sock, jid, `*Comandos*\n${PREFIX}testbutton — 5 variações de botão\n${PREFIX}testbutton A — só a variação A (0, A, B, C ou D)\n${PREFIX}ping`, m);
-      break;
+  const handler = COMMAND_HANDLERS[command];
+  if (!handler) {
+    await reply(sock, jid, m, {
+      text: `❌ Comando não encontrado. Use ${PREFIX}menu para ver as opções.`,
+    });
+    return;
+  }
 
-    case 'testbutton': {
-      const only = (args[0] || '').toUpperCase();
-      const list = only ? VARIANTS.filter((v) => v.key === only) : VARIANTS;
-      if (!list.length) { await sendText(sock, jid, `variação "${only}" não existe. Use: ${VARIANTS.map((v) => v.key).join(', ')}`, m); break; }
-      pauseFlush = true; // segura os logs até terminar, pra não misturar com os testes
-      try {
-        await sendText(sock, jid, `Enviando ${list.length} teste(s). Olhe no *celular* (iPhone e Android) e veja quais vieram COM botão.`, m);
-        for (const v of list) {
-          try {
-            const sent = await sendInteractive(
-              sock, jid,
-              { body: `Teste ${v.key}: ${v.label}`, footer: 'bao?', buttons: [quickReply(`clique ${v.key}`, v.key)] },
-              v.opts,
-            );
-            console.log(`→ variação ${v.key} enviada (${v.label}) id=${sent.key.id}`);
-          } catch (e) {
-            console.error(`✗ variação ${v.key} FALHOU:`, e?.stack || e);
-          }
-          await delay(2000);
-        }
-        await delay(4000); // tempo pros acks/receipts chegarem e entrarem nos logs
-        console.log('fim do ?testbutton — logs+XML logo abaixo');
-      } finally {
-        pauseFlush = false;
-        setTimeout(() => flushLogs().catch(() => {}), 300);
-      }
-      break;
-    }
-    default:
-      break;
+  try {
+    await handler({ sock, jid, sender, message: m, args, body });
+  } catch (error) {
+    console.error(`erro no comando ${PREFIX}${command}:`, error?.stack || error);
+    await reply(sock, jid, m, {
+      text: `❌ Erro ao processar comando: ${String(error?.message || error).slice(0, 100)}`,
+    });
   }
 }
 
-/* ═════════ 5. conexão + pairing code ═════════ */
+/* ═════════════════════════ conexão + pairing code ═════════════════════════ */
 async function getPairNumber() {
   if (pairNumber) return pairNumber;
-  origConsole.log('Digite o número do bot com DDI+DDD+9 (só dígitos, ex: 5562999999999) e dê Enter:');
+  console.log('Digite o número do bot com DDI+DDD+9 (só dígitos, ex: 5562999999999) e dê Enter:');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     const ans = await rl.question('> ', { signal: AbortSignal.timeout(180_000) });
     pairNumber = ans.replace(/\D/g, '');
-  } finally { rl.close(); }
-  if (pairNumber.length < 10 || pairNumber.length > 15) { pairNumber = ''; throw new Error('número inválido'); }
+  } finally {
+    rl.close();
+  }
+  if (pairNumber.length < 10 || pairNumber.length > 15) {
+    pairNumber = '';
+    throw new Error('número inválido');
+  }
   return pairNumber;
 }
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
   let version;
-  try { version = (await fetchLatestBaileysVersion()).version; }
-  catch (e) { console.warn('não consegui buscar a versão mais recente do WA, usando a padrão:', e?.message); }
+  try {
+    version = (await fetchLatestBaileysVersion()).version;
+  } catch (e) {
+    console.warn('não consegui buscar a versão mais recente do WA, usando a padrão:', e?.message);
+  }
 
   const sock = makeWASocket({
     ...(version ? { version } : {}),
@@ -359,17 +552,19 @@ async function start() {
     generateHighQualityLinkPreview: false,
     getMessage: async (key) => sentCache.get(key.id),
   });
+  setActiveSock(sock);
   sock.ev.on('creds.update', saveCreds);
 
-  // Watchdog: se a hospedagem bloqueia saída/DNS, o Baileys pode ficar mudo (e o processo sair
-  // sem aviso). Sem 'qr' (pareando) nem 'open' (já logado) dentro do prazo, avisa e reinicia.
+  // Watchdog: se a hospedagem bloqueia saída/DNS, o Baileys pode ficar mudo.
   let reached = false;
   let closedSeen = false;
   const watchdog = setTimeout(() => {
     if (reached) return;
-    console.error(`⏱ ${WATCHDOG_MS / 1000}s sem conseguir falar com o WhatsApp (hospedagem bloqueando saída? DNS? firewall?). Tentando de novo…`);
+    console.error(
+      `⏱ ${WATCHDOG_MS / 1000}s sem conseguir falar com o WhatsApp (hospedagem bloqueando saída? DNS? firewall?). Tentando de novo…`
+    );
     try { sock.end(new Error('watchdog: sem conexão')); } catch (e) { console.error('sock.end falhou:', e?.message); }
-    setTimeout(() => { if (!closedSeen) boot(); }, 5000); // garante o retry mesmo se o 'close' nunca vier
+    setTimeout(() => { if (!closedSeen) boot(); }, 5000);
   }, WATCHDOG_MS);
 
   let pairingRequested = false;
@@ -380,9 +575,15 @@ async function start() {
       const number = await getPairNumber();
       const code = await sock.requestPairingCode(number, PAIR_CODE);
       const pretty = code.match(/.{1,4}/g).join('-');
-      origConsole.log(`\n╔══════════════════════════════════════════╗\n   CÓDIGO DE PAREAMENTO:  ${pretty}\n   WhatsApp › Aparelhos conectados › Conectar\n   aparelho › Conectar com número de telefone\n╚══════════════════════════════════════════╝\n`);
+      console.log(
+        `\n╔══════════════════════════════════════════╗\n` +
+        `   CÓDIGO DE PAREAMENTO:  ${pretty}\n` +
+        `   WhatsApp › Aparelhos conectados › Conectar\n` +
+        `   aparelho › Conectar com número de telefone\n` +
+        `╚══════════════════════════════════════════╝\n`
+      );
     } catch (e) {
-      pairingRequested = false; // deixa tentar de novo no próximo evento
+      pairingRequested = false;
       const short = String(e?.stack || e).split('\n').slice(0, 3).join(' | ');
       console.error(`falha ao pedir o pairing code${pairNumber ? '' : ' (sem número: defina PAIR_NUMBER)'}: ${short}`);
     }
@@ -391,15 +592,16 @@ async function start() {
 
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u;
-    if (qr || connection === 'open') { reached = true; clearTimeout(watchdog); }
+    if (qr || connection === 'open') {
+      reached = true;
+      clearTimeout(watchdog);
+    }
     if (qr) askPairing();
     if (connection) console.log(`connection.update → ${connection}`);
 
     if (connection === 'open') {
-      setActiveSock(sock);
       console.log(`✅ Conectado como ${sock.user?.id}${sock.user?.lid ? ` (lid ${sock.user.lid})` : ''}`);
-      console.log(`Mande ${PREFIX}testbutton pra este número (ou pra você mesmo, em "Conversar comigo").`);
-      setTimeout(() => flushLogs().catch(() => {}), 1500);
+      console.log(`Mande ${PREFIX}menu pra este número (ou pra você mesmo, em "Conversar comigo").`);
     }
 
     if (connection === 'close') {
@@ -409,6 +611,7 @@ async function start() {
       const err = lastDisconnect?.error;
       const code = err?.output?.statusCode;
       console.error(`❌ conexão fechada: code=${code} (${DisconnectReason[code] ?? 'desconhecido'}) — ${err?.message}`);
+
       if (code === DisconnectReason.loggedOut) {
         console.error('Sessão deslogada: apagando a pasta de sessão e pareando de novo.');
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -424,8 +627,11 @@ async function start() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const m of messages) {
-      try { await onMessage(sock, m); }
-      catch (e) { console.error('erro no handler de mensagem:', e?.stack || e); }
+      try {
+        await onMessage(sock, m);
+      } catch (e) {
+        console.error('erro no handler de mensagem:', e?.stack || e);
+      }
     }
   });
 }
@@ -437,11 +643,31 @@ function boot() {
   });
 }
 
+/* ═════════════════════════ HTTP health (opcional) ═════════════════════════ */
 if (process.env.PORT) {
-  http.createServer((_q, r) => r.end('bot ok')).listen(process.env.PORT, () => origConsole.log(`http na porta ${process.env.PORT}`));
+  http
+    .createServer((_q, r) => r.end('bot ok'))
+    .listen(process.env.PORT, () => console.log(`http na porta ${process.env.PORT}`));
 }
 
 if (!process.env.BOT_NO_START) boot();
 
 // exportado só pra testes offline
-export { start, onMessage, sendInteractive, quickReply, buildNodes, compactXml, chunkLines, makeLogger, flushLogs, setActiveSock, logQueue, watchIds, sentCache, VARIANTS, getInteractiveReply, safe };
+export {
+  start,
+  boot,
+  onMessage,
+  COMMAND_HANDLERS,
+  sendMenu,
+  handleMenuPoll,
+  imageToSticker,
+  stickerToImage,
+  handleGroupAction,
+  executeCode,
+  sendMessageInfo,
+  makeLogger,
+  sentCache,
+  messageStore,
+  menuSessions,
+  setActiveSock,
+};
