@@ -1,33 +1,26 @@
 /**
- * bot.mjs - bot Baileys 7 em um unico arquivo
- *   - login por pairing code (8 caracteres)
- *   - comandos do Codigo 1 (menu por enquete, figurinhas, moderacao, etc.)
- *   - NAO encaminha nenhum log pro WhatsApp
- *   - sharp carregado sob demanda (nao quebra o boot se faltar)
- *   - codigo-fonte 100% ASCII: emojis/acentos via \u{...}, sem depender de encoding
- *
+ * bot.mjs - bot Baileys Completo (Listas, YT Downloader, Stickers Animados, Live Photo)
+ * 
  * Rodar:  node bot.mjs      (Node >= 20)
  * Env:
- *   PAIR_CODE     pairing code customizado, exatamente 8 chars (padrao: aleatorio)
+ *   PAIR_CODE     pairing code customizado, exatamente 8 chars
  *   PREFIX        prefixo dos comandos (padrao: ?)
  *   AUTH_DIR      pasta da sessao (padrao: ./auth)
- *   PORT          se definido, abre um HTTP "ok" (hospedagens que exigem porta)
- *   BAILEYS_LOG   error | warn | info | debug | trace (padrao: warn)
- *   WATCHDOG_MS   watchdog de conexao (padrao: 60000)
- *   ENABLE_EVAL   "true" habilita ?execute / ?exec / ?eval (owner only)
- *   OWNER_JIDS    lista separada por virgulas de JIDs do(s) dono(s)
- *   BOT_NO_START  se definido, nao inicia automaticamente (para testes)
+ *   PORT          porta http de health check
+ *   BAILEYS_LOG   error | warn | info (padrao: warn)
  */
+
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
   fetchLatestBaileysVersion,
   downloadContentFromMessage,
-  getAggregateVotesInPollMessage,
 } from '@whiskeysockets/baileys';
 import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
+import crypto from 'node:crypto';
 
 /* ============================ config ============================ */
 const PREFIX = process.env.PREFIX || '?';
@@ -35,23 +28,21 @@ const AUTH_DIR = process.env.AUTH_DIR || './auth';
 const PAIR_CODE = (process.env.PAIR_CODE || '').toUpperCase() || undefined;
 const WATCHDOG_MS = Number(process.env.WATCHDOG_MS) || 60_000;
 const ENABLE_EVAL = process.env.ENABLE_EVAL === 'true';
-const OWNER_JIDS = new Set(
-  (process.env.OWNER_JIDS || '')
-    .split(',')
-    .map((j) => j.trim())
-    .filter(Boolean)
-);
+const OWNER_JIDS = new Set((process.env.OWNER_JIDS || '').split(',').map((j) => j.trim()).filter(Boolean));
 
-/* ==================== numero fixo do bot ==================== */
 const PAIR_NUMBER = '5562996664760';
+
+/* ============================ pasta temporaria ============================ */
+const TMP_DIR = './tmp';
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
 
 /* ============================ estado ============================ */
 let activeSock = null;
 const setActiveSock = (s) => { activeSock = s; };
 
-const sentCache = new Map();      // id -> message (retry / eco do proprio bot)
-const messageStore = new Map();   // id -> message (reconstruir enquete)
-const menuSessions = new Map();   // chave da enquete -> sessao do menu
+const sentCache = new Map();
+const messageStore = new Map();
+const ytSessions = new Map(); // Controle de sessoes do YouTube por JID_Sender
 
 function rememberSent(msg) {
   const id = msg?.key?.id;
@@ -60,70 +51,34 @@ function rememberSent(msg) {
   if (sentCache.size > 500) sentCache.delete(sentCache.keys().next().value);
 }
 
-/* ==================== emojis como escapes unicode ==================== */
-// O arquivo-fonte e ASCII puro. Estes sao os mesmos caracteres que apareciam
-// nos textos originais - em runtime ficam identicos.
+function storeMessage(message) {
+  if (!message?.key?.id) return;
+  messageStore.set(message.key.id, message);
+  if (messageStore.size > 1000) messageStore.delete(messageStore.keys().next().value);
+}
+
+/* ==================== emojis ascii ==================== */
 const E = {
-  camera:  '\u{1F4F8}',           // camera
-  police:  '\u{1F46E}',           // policial
-  tools:   '\u{1F6E0}\u{FE0F}',   // ferramentas
-  info:    '\u{2139}\u{FE0F}',    // info
-  picture: '\u{1F5BC}\u{FE0F}',   // quadro
-  robot:   '\u{1F916}',           // robo
-  users:   '\u{1F465}',           // pessoas
-  bolt:    '\u{26A1}',            // raio
-  trash:   '\u{1F5D1}\u{FE0F}',   // lixeira
-  up:      '\u{2B06}\u{FE0F}',    // seta pra cima
-  down:    '\u{2B07}\u{FE0F}',    // seta pra baixo
-  point:   '\u{261D}\u{FE0F}',    // dedinho pra cima
-  x:       '\u{274C}',            // X vermelho
-  ping:    '\u{1F3D3}',           // ping-pong
-  clock:   '\u{23F1}\u{FE0F}',    // cronometro
-  lock:    '\u{1F510}',           // cadeado
-  no:      '\u{26D4}',            // proibido
-  ok:      '\u{2705}',            // check verde
+  camera:  '\u{1F4F8}', police:  '\u{1F46E}', tools:   '\u{1F6E0}\u{FE0F}',
+  info:    '\u{2139}\u{FE0F}', picture: '\u{1F5BC}\u{FE0F}', robot:   '\u{1F916}',
+  users:   '\u{1F465}', bolt:    '\u{26A1}', trash:   '\u{1F5D1}\u{FE0F}',
+  up:      '\u{2B06}\u{FE0F}', down:    '\u{2B07}\u{FE0F}', point:   '\u{261D}\u{FE0F}',
+  x:       '\u{274C}', ping:    '\u{1F3D3}', clock:   '\u{23F1}\u{FE0F}',
+  lock:    '\u{1F510}', no:      '\u{26D4}', ok:      '\u{2705}',
+  music:   '\u{1F3B5}', play:    '\u{25B6}\u{FE0F}', film:    '\u{1F3AC}',
+  warning: '\u{26A0}\u{FE0F}', loading: '\u{23F3}',
 };
 
-/* ==================== logger do Baileys ==================== */
-const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
-const BA_LEVEL = LEVELS[process.env.BAILEYS_LOG] !== undefined ? process.env.BAILEYS_LOG : 'warn';
-const BA_MAX = LEVELS[BA_LEVEL];
-
-function safeString(v, max = 500) {
-  try {
-    const s = typeof v === 'string' ? v : JSON.stringify(v, (_k, val) => {
-      if (typeof val === 'bigint') return val.toString();
-      if (val instanceof Error) return { name: val.name, message: val.message };
-      if (val instanceof Uint8Array) return '<' + val.length + ' bytes>';
-      return val;
-    });
-    return s && s.length > max ? s.slice(0, max) + '...' : s;
-  } catch { return String(v); }
-}
-
+/* ==================== logger e utilitarios ==================== */
 function makeLogger() {
   const emit = (lvl, a, b) => {
-    if (LEVELS[lvl] > BA_MAX) return;
-    const parts = ['[baileys]', b || ''].filter(Boolean);
-    if (a !== undefined && a !== null) {
-      parts.push(a instanceof Error ? (a.stack || a.message) : safeString(a));
-    }
-    const fn = lvl === 'error' ? console.error : lvl === 'warn' ? console.warn : console.log;
-    fn(...parts);
+    if (lvl === 'trace' || lvl === 'debug') return;
+    const msg = a instanceof Error ? a.stack : String(a);
+    console.log(`[baileys] ${b || ''} ${msg}`.trim());
   };
-  const lg = {
-    level: 'trace',
-    child: () => lg,
-    trace: (o, m) => emit('trace', o, m),
-    debug: (o, m) => emit('debug', o, m),
-    info:  (o, m) => emit('info',  o, m),
-    warn:  (o, m) => emit('warn',  o, m),
-    error: (o, m) => emit('error', o, m),
-  };
-  return lg;
+  return { level: 'trace', child: () => makeLogger(), trace: (o, m) => emit('trace', o, m), debug: (o, m) => emit('debug', o, m), info: (o, m) => emit('info', o, m), warn: (o, m) => emit('warn', o, m), error: (o, m) => emit('error', o, m) };
 }
 
-/* ==================== utilitarios ==================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const normalizeJid = (jid) => String(jid || '').replace(/:.*/, '').trim().toLowerCase();
 const isGroup = (jid) => jid?.endsWith('@g.us') ?? false;
@@ -132,11 +87,7 @@ const isOwner = (jid) => OWNER_JIDS.has(normalizeJid(jid));
 function unwrap(message) {
   let content = message?.message;
   while (content) {
-    const wrapper =
-      content.ephemeralMessage ||
-      content.viewOnceMessage ||
-      content.viewOnceMessageV2 ||
-      content.documentWithCaptionMessage;
+    const wrapper = content.ephemeralMessage || content.viewOnceMessage || content.viewOnceMessageV2 || content.documentWithCaptionMessage;
     if (!wrapper?.message) break;
     content = wrapper.message;
   }
@@ -145,28 +96,10 @@ function unwrap(message) {
 
 function textOf(message) {
   const c = unwrap(message);
-  return (
-    c.conversation ||
-    c.extendedTextMessage?.text ||
-    c.imageMessage?.caption ||
-    c.videoMessage?.caption ||
-    c.documentMessage?.caption ||
-    c.buttonsResponseMessage?.selectedButtonId ||
-    c.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    c.templateButtonReplyMessage?.selectedId ||
-    ''
-  ).trim();
+  return (c.conversation || c.extendedTextMessage?.text || c.imageMessage?.caption || c.videoMessage?.caption || c.documentMessage?.caption || '').trim();
 }
 
-function senderOf(message) {
-  return message.key.participant || message.key.remoteJid || '';
-}
-
-function storeMessage(message) {
-  if (!message?.key?.id) return;
-  messageStore.set(message.key.id, message);
-  if (messageStore.size > 1000) messageStore.delete(messageStore.keys().next().value);
-}
+function senderOf(message) { return message.key.participant || message.key.remoteJid || ''; }
 
 async function reply(sock, jid, message, content) {
   const sent = await sock.sendMessage(jid, content, { quoted: message });
@@ -174,385 +107,348 @@ async function reply(sock, jid, message, content) {
   return sent;
 }
 
-async function replyError(sock, jid, message, error) {
-  return reply(sock, jid, message, { text: E.x + ' Erro: ' + (error?.message || error) });
-}
-
-/* ==================== textos do menu ==================== */
-const MENU_OPTIONS = [
-  E.camera + ' Figuras',
-  E.police + ' Modera\u00E7\u00E3o',
-  E.tools  + ' Utilit\u00E1rios',
-  E.info   + ' Sobre',
-];
-
-const MENU_RESPONSES = {
-  [E.camera + ' Figuras']: () =>
-    '*' + E.picture + ' MENU FIGURAS*\n\n' +
-    PREFIX + 's       - Responda uma imagem para converter em figurinha\n' +
-    PREFIX + 'sticker - Alias de ' + PREFIX + 's\n' +
-    PREFIX + 'fig     - Alias de ' + PREFIX + 's\n' +
-    PREFIX + 'img     - Responda uma figurinha para converter em imagem\n' +
-    PREFIX + 'toimg   - Alias de ' + PREFIX + 'img\n' +
-    PREFIX + 'imagem  - Alias de ' + PREFIX + 'img',
-
-  [E.police + ' Modera\u00E7\u00E3o']: () =>
-    '*' + E.police + ' MENU MODERA\u00C7\u00C3O* (apenas admins do grupo)\n\n' +
-    PREFIX + 'ban @user     - Remove um membro do grupo\n' +
-    PREFIX + 'promote @user - Promove um membro a administrador\n' +
-    PREFIX + 'demote @user  - Remove um membro de administrador',
-
-  [E.tools + ' Utilit\u00E1rios']: () =>
-    '*' + E.tools + ' MENU UTILIT\u00C1RIOS*\n\n' +
-    PREFIX + 'menu    - Mostra este menu\n' +
-    PREFIX + 'help    - Alias de ' + PREFIX + 'menu\n' +
-    PREFIX + 'ping    - Verifica se o bot esta online\n' +
-    PREFIX + 'uptime  - Mostra o tempo de atividade\n' +
-    PREFIX + 'info    - Informacoes da mensagem respondida\n' +
-    PREFIX + 'execute <code> - Executa JS (owner, se habilitado)\n' +
-    PREFIX + 'exec    - Alias de ' + PREFIX + 'execute\n' +
-    PREFIX + 'eval    - Alias de ' + PREFIX + 'execute',
-
-  [E.info + ' Sobre']: () =>
-    '*' + E.info + ' SOBRE O BOT*\n\n' +
-    E.robot + ' SyntraxBot v1.1\n' +
-    'Bot de WhatsApp usando Baileys\n' +
-    E.users + ' Suporte a grupos e privados\n' +
-    E.bolt + ' Comandos: ' + PREFIX + 'menu\n\n' +
-    'Prefix: ' + PREFIX,
-};
-
-const GROUP_ACTION_LABELS = {
-  remove:  E.trash + ' Membro removido do grupo!',
-  promote: E.up + ' Usu\u00E1rio promovido a administrador!',
-  demote:  E.down + ' Administrador rebaixado.',
-};
-
-/* ==================== enquete / menu ==================== */
-function getPollUpdate(message) {
-  return unwrap(message).pollUpdateMessage || null;
-}
-
-function pollKeyStr(key) {
-  return key ? key.remoteJid + ':' + key.id : '';
-}
-
-function getPollCreationKey(update) {
-  return update?.pollCreationMessageKey || update?.pollCreationMessage?.key || null;
-}
-
-async function sendMenu(sock, jid, sender) {
-  const poll = await sock.sendMessage(jid, {
-    poll: {
-      name: 'Menu SyntraxBot',
-      values: MENU_OPTIONS,
-      selectableCount: 1,
-    },
-  });
-  rememberSent(poll);
-  if (poll?.key?.id) messageStore.set(poll.key.id, poll);
-
-  const response = await sock.sendMessage(
-    jid,
-    { text: '*Selecione uma categoria acima ' + E.point + '*' },
-    { quoted: poll }
-  );
-  rememberSent(response);
-
-  if (poll?.key?.id && response?.key?.id) {
-    menuSessions.set(pollKeyStr(poll.key), {
-      jid,
-      sender: normalizeJid(sender),
-      responseKey: response.key,
-      pollKey: poll.key,
-      createdAt: Date.now(),
-    });
-  }
-}
-
-async function handleMenuPoll(sock, message) {
-  const update = getPollUpdate(message);
-  if (!update) return false;
-
-  const pollKey = getPollCreationKey(update);
-  if (!pollKey) return false;
-
-  const session = menuSessions.get(pollKeyStr(pollKey));
-  if (!session) return true;
-
-  const voter = update.voterJid || message.key.participant || message.key.remoteJid;
-  if (normalizeJid(voter) !== session.sender) return true;
-
-  const votes = getAggregateVotesInPollMessage({
-    message: messageStore.get(pollKey.id),
-    pollUpdates: [message],
-  });
-
-  const selected = MENU_OPTIONS.find((option) => votes?.[option]?.length > 0);
-  if (!selected) return true;
-
+/* ==================== importacao preguicosa (lazy) ==================== */
+let libs = {};
+async function loadLibs() {
+  if (libs.sharp) return libs;
   try {
-    await sock.sendMessage(session.jid, {
-      text: MENU_RESPONSES[selected](),
-      edit: session.responseKey,
-    });
+    libs.sharp = (await import('sharp')).default;
+    libs.ffmpeg = (await import('fluent-ffmpeg')).default;
+    libs.yts = (await import('yt-search')).default;
+    libs.ytdl = (await import('@distube/ytdl-core')).default;
   } catch (e) {
-    console.error('erro ao editar resposta do menu:', e?.message || e);
+    console.error('Falta dependencia! Rode: npm i sharp fluent-ffmpeg yt-search @distube/ytdl-core');
+    console.error(e.message);
   }
-  menuSessions.delete(pollKeyStr(pollKey));
-  return true;
+  return libs;
 }
 
-/* ==================== sharp (lazy) ==================== */
-let sharpPromise = null;
-function getSharp() {
-  if (!sharpPromise) {
-    sharpPromise = import('sharp')
-      .then((m) => m.default || m)
-      .catch((e) => {
-        sharpPromise = null;
-        throw new Error(
-          'sharp nao esta disponivel neste ambiente - adicione "sharp" nas dependencias. Detalhe: ' +
-            (e?.message || e)
-        );
-      });
-  }
-  return sharpPromise;
-}
-
-/* ==================== conversao de midia ==================== */
-async function downloadAsBuffer(mediaMessage, mediaType) {
+/* ==================== download helper ==================== */
+async function downloadMedia(mediaMessage, mediaType) {
   const stream = await downloadContentFromMessage(mediaMessage, mediaType);
   const chunks = [];
   for await (const chunk of stream) chunks.push(chunk);
   return Buffer.concat(chunks);
 }
 
-async function stickerToImage(sock, message, jid) {
+const getTempFile = (ext) => path.join(TMP_DIR, `${crypto.randomBytes(6).toString('hex')}.${ext}`);
+
+/* ==================== LISTAS (NOVO MENU) ==================== */
+const MENU_TEXTOS = {
+  'menu_fig': '*' + E.picture + ' MENU FIGURAS*\n\n' + PREFIX + 's - Cria figurinha (img/gif/video)\n' + PREFIX + 'tolivep - Cria Live Photo (video/gif)\n' + PREFIX + 'img - Figurinha para Imagem',
+  'menu_mod': '*' + E.police + ' MENU MODERA\u00C7\u00C3O*\n\n' + PREFIX + 'ban @user\n' + PREFIX + 'promote @user\n' + PREFIX + 'demote @user',
+  'menu_util': '*' + E.tools + ' MENU UTILIT\u00C1RIOS*\n\n' + PREFIX + 'ping\n' + PREFIX + 'uptime\n' + PREFIX + 'info',
+  'menu_yt': '*' + E.play + ' MENU YOUTUBE*\n\n' + PREFIX + 'play <nome> - Busca e baixa musicas ou videos do YouTube',
+};
+
+async function sendListMenu(sock, jid, message) {
+  const sections = [{
+    title: 'Escolha uma categoria',
+    rows: [
+      { title: E.camera + ' Figuras / M\u00EDdia', rowId: 'cmd_menu_fig', description: 'Stickers e Live Photos' },
+      { title: E.play + ' YouTube', rowId: 'cmd_menu_yt', description: 'Baixar audios e videos' },
+      { title: E.police + ' Modera\u00E7\u00E3o', rowId: 'cmd_menu_mod', description: 'Apenas Admins' },
+      { title: E.tools + ' Utilit\u00E1rios', rowId: 'cmd_menu_util', description: 'Ping, info, etc' },
+    ]
+  }];
+
+  await sock.sendMessage(jid, {
+    text: '*' + E.robot + ' SyntraxBot - Menu Principal*\nSelecione uma opcao abaixo:',
+    footer: 'SyntraxBot v1.2',
+    buttonText: 'ABRIR MENU',
+    sections
+  }, { quoted: message });
+}
+
+/* ==================== COMANDOS DE M\u00CDDIA (STICKER / LIVE PHOTO) ==================== */
+async function handleSticker(sock, jid, message) {
+  const content = unwrap(message);
+  const isImage = !!content.imageMessage;
+  const isVideo = !!content.videoMessage;
+  const media = content.imageMessage || content.videoMessage;
+
+  if (!media) return reply(sock, jid, message, { text: 'Responda uma imagem, GIF ou v\u00EDdeo curto com ' + PREFIX + 's' });
+
+  const { sharp, ffmpeg } = await loadLibs();
+  if (!sharp || !ffmpeg) return reply(sock, jid, message, { text: 'Faltam bibliotecas no servidor.' });
+
   try {
-    const sticker = unwrap(message).stickerMessage;
-    if (!sticker) {
-      await reply(sock, jid, message, { text: 'Responda uma figurinha com ' + PREFIX + 'img' });
-      return;
+    const buf = await downloadMedia(media, isImage ? 'image' : 'video');
+    
+    if (isImage) {
+      const webp = await sharp(buf).resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp().toBuffer();
+      return reply(sock, jid, message, { sticker: webp });
+    } else {
+      // Video ou GIF animado -> Sticker Animado
+      if (media.seconds > 10) return reply(sock, jid, message, { text: 'O v\u00EDdeo deve ter menos de 10 segundos.' });
+      
+      const inFile = getTempFile('mp4');
+      const outFile = getTempFile('webp');
+      fs.writeFileSync(inFile, buf);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(inFile)
+          .inputOptions(['-t', '10'])
+          .complexFilter(['scale=512:512:flags=lanczos:force_original_aspect_ratio=decrease', 'format=rgba', 'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000'])
+          .outputOptions(['-vcodec', 'libwebp', '-lossless', '0', '-qscale', '50', '-loop', '0', '-preset', 'default', '-an', '-vsync', '0'])
+          .save(outFile).on('end', resolve).on('error', reject);
+      });
+
+      await reply(sock, jid, message, { sticker: fs.readFileSync(outFile) });
+      fs.unlinkSync(inFile); fs.unlinkSync(outFile);
     }
-    const sharp = await getSharp();
-    const buf = await downloadAsBuffer(sticker, 'image');
-    const image = await sharp(buf).png().toBuffer();
-    await reply(sock, jid, message, { image, caption: E.picture + ' Sua imagem' });
   } catch (error) {
-    console.error('stickerToImage:', error?.stack || error);
-    await replyError(sock, jid, message, error);
+    console.error('Erro no sticker:', error);
+    reply(sock, jid, message, { text: E.x + ' Falha ao criar sticker.' });
   }
 }
 
-async function imageToSticker(sock, message, jid) {
+async function handleLivePhoto(sock, jid, message) {
+  const content = unwrap(message);
+  const media = content.videoMessage;
+  if (!media) return reply(sock, jid, message, { text: 'Responda um v\u00EDdeo ou GIF com ' + PREFIX + 'tolivep' });
+  if (media.seconds > 60) return reply(sock, jid, message, { text: 'O v\u00EDdeo deve ter no m\u00E1ximo 60 segundos.' });
+
+  const { ffmpeg } = await loadLibs();
+  if (!ffmpeg) return;
+
   try {
-    const image = unwrap(message).imageMessage;
-    if (!image) {
-      await reply(sock, jid, message, { text: 'Responda uma imagem com ' + PREFIX + 's' });
-      return;
-    }
-    const sharp = await getSharp();
-    const buf = await downloadAsBuffer(image, 'image');
-    const webp = await sharp(buf)
-      .resize(512, 512, { fit: 'cover', withoutEnlargement: false })
-      .webp()
-      .toBuffer();
-    await reply(sock, jid, message, { sticker: webp });
+    const buf = await downloadMedia(media, 'video');
+    const inFile = getTempFile('mp4');
+    const outFile = getTempFile('mp4');
+    fs.writeFileSync(inFile, buf);
+
+    await new Promise((resolve, reject) => {
+      // Live photo (Video Note) exige ser quadrado (1:1)
+      ffmpeg(inFile)
+        .complexFilter(['scale=400:400:force_original_aspect_ratio=increase', 'crop=400:400'])
+        .outputOptions(['-c:v', 'libx264', '-crf', '28', '-preset', 'superfast', '-c:a', 'aac', '-b:a', '128k', '-pix_fmt', 'yuv420p'])
+        .save(outFile).on('end', resolve).on('error', reject);
+    });
+
+    // PTV: true define que e uma Live Photo / Video Note
+    await sock.sendMessage(jid, { video: fs.readFileSync(outFile), ptv: true }, { quoted: message });
+    fs.unlinkSync(inFile); fs.unlinkSync(outFile);
   } catch (error) {
-    console.error('imageToSticker:', error?.stack || error);
-    await replyError(sock, jid, message, error);
+    console.error('Erro no tolivep:', error);
+    reply(sock, jid, message, { text: E.x + ' Falha ao processar live photo.' });
   }
 }
 
-/* ==================== comandos de grupo ==================== */
-async function getGroupInfo(sock, jid, sender) {
-  const metadata = await sock.groupMetadata(jid);
-  const senderParticipant = metadata.participants.find(
-    (p) => normalizeJid(p.id) === normalizeJid(sender)
-  );
-  const botParticipant = metadata.participants.find(
-    (p) => normalizeJid(p.id) === normalizeJid(sock.user.id)
-  );
-  return {
+/* ==================== YOUTUBE DOWNLOADER & FILA ==================== */
+const ytQueue = [];
+let isProcessingYt = false;
+
+async function processYtQueue(sock) {
+  if (isProcessingYt || ytQueue.length === 0) return;
+  isProcessingYt = true;
+  const task = ytQueue.shift();
+  try {
+    await task.execute(sock);
+  } catch (err) {
+    console.error('Erro na fila do YT:', err);
+    await sock.sendMessage(task.jid, { text: E.x + ' Erro ao processar seu download.' });
+  } finally {
+    isProcessingYt = false;
+    processYtQueue(sock);
+  }
+}
+
+async function handleYtSearch(sock, jid, sender, query, message) {
+  if (!query) return reply(sock, jid, message, { text: 'Use: ' + PREFIX + 'play <nome da musica>' });
+  
+  const { yts } = await loadLibs();
+  if (!yts) return reply(sock, jid, message, { text: 'M\u00F3dulo YouTube n\u00E3o carregado.' });
+
+  await reply(sock, jid, message, { text: E.loading + ' Buscando no YouTube...' });
+  
+  try {
+    const results = await yts(query);
+    const videos = results.videos.slice(0, 5);
+    if (!videos.length) return reply(sock, jid, message, { text: E.x + ' Nenhum resultado encontrado.' });
+
+    // Salva a sessao do usuario
+    const sessionId = jid + '_' + sender;
+    ytSessions.set(sessionId, { videos, updatedAt: Date.now() });
+
+    const rows = videos.map((v, index) => ({
+      title: v.title.slice(0, 70),
+      rowId: `yt_sel_${index}`,
+      description: `${v.timestamp} - ${v.author.name}`.slice(0, 72)
+    }));
+
+    await sock.sendMessage(jid, {
+      text: '*' + E.music + ' Resultados para:* ' + query,
+      footer: 'Selecione o v\u00EDdeo abaixo',
+      buttonText: 'VER RESULTADOS',
+      sections: [{ title: 'M\u00FAsicas Encontradas', rows }]
+    }, { quoted: message });
+
+  } catch (e) {
+    console.error(e);
+    reply(sock, jid, message, { text: E.x + ' Erro na busca.' });
+  }
+}
+
+async function enqueueYtDownload(sock, jid, videoInfo, format) {
+  const msgInfo = await sock.sendMessage(jid, { text: E.loading + ` Colocando "${videoInfo.title}" na fila de ${format} (Posi\u00E7\u00E3o: ${ytQueue.length + 1}). Aguarde...` });
+  
+  ytQueue.push({
     jid,
-    isAdmin:
-      senderParticipant?.admin === 'admin' || senderParticipant?.admin === 'superadmin',
-    isBotAdmin:
-      botParticipant?.admin === 'admin' || botParticipant?.admin === 'superadmin',
-  };
+    execute: async (s) => {
+      await s.sendMessage(jid, { text: E.clock + ` Baixando ${format}: ${videoInfo.title}...` }, { edit: msgInfo.key });
+      
+      const { ytdl } = await loadLibs();
+      
+      // NOTA PARA A RAILWAY:
+      // Se o IP for banido e pedir 'Sign in to confirm you are not a bot',
+      // voce precisa criar um Agent com cookies no ytdl-core.
+      // const agent = ytdl.createAgent([{ name: "cookie_name", value: "cookie_value" }]);
+      // E passar abaixo: ytdl(url, { agent, filter: ... })
+      
+      const MAX_MINS = 15; // Limite de 15 min
+      if (videoInfo.seconds > (MAX_MINS * 60)) {
+         return s.sendMessage(jid, { text: E.no + ' O v\u00EDdeo excede o limite de ' + MAX_MINS + ' minutos.' });
+      }
+
+      const streamInfo = format === 'audio' 
+        ? { filter: 'audioonly', quality: 'highestaudio' }
+        : { filter: 'audioandvideo', quality: 'highest' }; // Para video as vezes 'highest' limita a 720p 30fps
+
+      const tmpPath = getTempFile(format === 'audio' ? 'mp3' : 'mp4');
+      const writeStream = fs.createWriteStream(tmpPath);
+      
+      return new Promise((resolve, reject) => {
+        const stream = ytdl(videoInfo.url, streamInfo);
+        
+        let downloadedMB = 0;
+        stream.on('data', (chunk) => {
+          downloadedMB += chunk.length / 1024 / 1024;
+          if (downloadedMB > 55) { // WA aceita max 50-64MB
+            stream.destroy();
+            reject(new Error('Tamanho excedeu 50MB'));
+          }
+        });
+
+        stream.pipe(writeStream);
+        
+        writeStream.on('finish', async () => {
+          try {
+            if (format === 'audio') {
+              await s.sendMessage(jid, { document: fs.readFileSync(tmpPath), mimetype: 'audio/mpeg', fileName: videoInfo.title + '.mp3' });
+            } else {
+              await s.sendMessage(jid, { video: fs.readFileSync(tmpPath), caption: videoInfo.title });
+            }
+            fs.unlinkSync(tmpPath);
+            resolve();
+          } catch (e) { reject(e); }
+        });
+        
+        stream.on('error', reject);
+        writeStream.on('error', reject);
+      });
+    }
+  });
+  
+  processYtQueue(sock);
 }
 
-function mentionedJidsOf(message) {
-  const c = unwrap(message);
-  return c.extendedTextMessage?.contextInfo?.mentionedJid || [];
-}
-
-async function handleGroupAction(sock, jid, sender, action, message) {
-  if (!isGroup(jid)) {
-    await reply(sock, jid, message, { text: 'Este comando so funciona em grupos.' });
+/* ==================== INTERCEPTADOR DE LISTAS ==================== */
+async function handleListResponse(sock, jid, sender, message, rowId) {
+  // Trata menus estaticos
+  if (rowId.startsWith('cmd_menu_')) {
+    const txt = MENU_TEXTOS[rowId.replace('cmd_', '')];
+    if (txt) await sock.sendMessage(jid, { text: txt });
     return;
   }
 
-  const group = await getGroupInfo(sock, jid, sender);
-
-  if (!group.isAdmin) {
-    await reply(sock, jid, message, {
-      text: E.police + ' Apenas administradores podem usar este comando.',
-    });
+  // Trata selecao de video do YT
+  if (rowId.startsWith('yt_sel_')) {
+    const idx = parseInt(rowId.replace('yt_sel_', ''));
+    const sessionId = jid + '_' + sender;
+    const session = ytSessions.get(sessionId);
+    if (!session || !session.videos[idx]) {
+      return sock.sendMessage(jid, { text: E.warning + ' Sess\u00E3o de busca expirada. Busque novamente.' });
+    }
+    
+    const video = session.videos[idx];
+    session.selectedVideo = video; // Salva escolha
+    
+    await sock.sendMessage(jid, {
+      text: `*${video.title}*\n\nComo voc\u00EA deseja baixar?`,
+      footer: 'Escolha o formato',
+      buttonText: 'FORMATO',
+      sections: [{
+        title: 'Op\u00E7\u00F5es',
+        rows: [
+          { title: E.music + ' Apenas \u00C1udio', rowId: 'yt_fmt_audio', description: 'Download em MP3' },
+          { title: E.film + ' V\u00EDdeo Completo', rowId: 'yt_fmt_video', description: 'Download em MP4' }
+        ]
+      }]
+    }, { quoted: message });
     return;
   }
-  if (!group.isBotAdmin) {
-    await reply(sock, jid, message, {
-      text: E.robot + ' Eu preciso ser administrador do grupo para isso.',
-    });
-    return;
-  }
 
-  const mentions = mentionedJidsOf(message);
-  if (!mentions.length) {
-    await reply(sock, jid, message, { text: 'Use: ' + PREFIX + action + ' @usuario' });
-    return;
-  }
-
-  try {
-    await sock.groupParticipantsUpdate(jid, [mentions[0]], action);
-    await reply(sock, jid, message, {
-      text: GROUP_ACTION_LABELS[action] || 'Acao realizada!',
-    });
-  } catch (error) {
-    console.error('handleGroupAction:', error?.stack || error);
-    await replyError(sock, jid, message, error);
+  // Trata selecao do formato de download (audio ou video)
+  if (rowId === 'yt_fmt_audio' || rowId === 'yt_fmt_video') {
+    const sessionId = jid + '_' + sender;
+    const session = ytSessions.get(sessionId);
+    if (!session || !session.selectedVideo) return sock.sendMessage(jid, { text: E.warning + ' Sessa\u00E3o expirada.' });
+    
+    const format = rowId === 'yt_fmt_audio' ? 'audio' : 'video';
+    ytSessions.delete(sessionId); // limpa a sessao
+    await enqueueYtDownload(sock, jid, session.selectedVideo, format);
   }
 }
 
-/* ==================== info da mensagem ==================== */
-async function sendMessageInfo(sock, jid, message) {
-  try {
-    const content = unwrap(message);
-    const info = {
-      remoteJid: message.key.remoteJid,
-      messageId: message.key.id,
-      timestamp: new Date(Number(message.messageTimestamp) * 1000),
-      fromMe: message.key.fromMe,
-      sender: senderOf(message),
-      text: textOf(message).slice(0, 100),
-      contentType: Object.keys(content)[0] || 'unknown',
-      hasMedia:
-        !!content.imageMessage || !!content.videoMessage || !!content.documentMessage,
-      isQuoted: !!content.extendedTextMessage?.contextInfo?.quotedMessage,
-      mentions: content.extendedTextMessage?.contextInfo?.mentionedJid || [],
-    };
-    const formatted = JSON.stringify(info, null, 2);
-    const output = formatted.length > 4096 ? formatted.slice(0, 4000) + '...' : formatted;
-    await reply(sock, jid, message, { text: '```\n' + output + '\n```' });
-  } catch (error) {
-    console.error('sendMessageInfo:', error?.stack || error);
-    await replyError(sock, jid, message, error);
-  }
-}
-
-/* ==================== execucao de codigo (owner) ==================== */
+/* ==================== comandos de grupo/uteis originais ==================== */
 async function executeCode(sock, jid, sender, code, message) {
-  if (!ENABLE_EVAL) {
-    await reply(sock, jid, message, { text: E.no + ' Execucao de codigo esta desativada.' });
-    return;
-  }
-  if (!isOwner(sender)) {
-    await reply(sock, jid, message, {
-      text: E.lock + ' Apenas o proprietario pode executar codigo.',
-    });
-    return;
-  }
-  if (!code.trim()) {
-    await reply(sock, jid, message, { text: 'Uso: ' + PREFIX + 'execute <codigo JavaScript>' });
-    return;
-  }
-
+  if (!ENABLE_EVAL) return reply(sock, jid, message, { text: E.no + ' Execucao desativada.' });
+  if (!isOwner(sender)) return reply(sock, jid, message, { text: E.lock + ' Somente dono.' });
   try {
-    const result = await new Function(
-      'socket',
-      'jid',
-      'sender',
-      'msg',
-      'sleep',
-      'return (async () => {\n' + code + '\n})()'
-    )(sock, jid, sender, message, sleep);
-
-    const output =
-      result === undefined
-        ? E.ok + ' Executado sem retorno'
-        : typeof result === 'string'
-          ? result
-          : JSON.stringify(result, null, 2);
-
-    await reply(sock, jid, message, { text: '```\n' + output.slice(0, 4000) + '\n```' });
-  } catch (error) {
-    console.error('executeCode:', error?.stack || error);
-    await reply(sock, jid, message, {
-      text: '```\n' + String(error?.message || error).slice(0, 500) + '\n```',
-    });
-  }
+    const result = await new Function('socket', 'jid', 'sender', 'msg', 'sleep', 'return (async () => {\n' + code + '\n})()')(sock, jid, sender, message, sleep);
+    const out = result === undefined ? E.ok : typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    await reply(sock, jid, message, { text: '```\n' + out.slice(0, 4000) + '\n```' });
+  } catch (error) { await reply(sock, jid, message, { text: String(error).slice(0,500) }); }
 }
 
-/* ==================== tabela de comandos ==================== */
 const COMMAND_HANDLERS = {
-  menu: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
-  help: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
-
+  menu: ({ sock, jid, message }) => sendListMenu(sock, jid, message),
+  help: ({ sock, jid, message }) => sendListMenu(sock, jid, message),
   ping: ({ sock, jid, message }) => reply(sock, jid, message, { text: E.ping + ' Pong!' }),
+  uptime: ({ sock, jid, message }) => reply(sock, jid, message, { text: E.clock + ' Uptime: ' + Math.floor(process.uptime()) + 's' }),
+  
+  s:       ({ sock, jid, message }) => handleSticker(sock, jid, message),
+  sticker: ({ sock, jid, message }) => handleSticker(sock, jid, message),
+  fig:     ({ sock, jid, message }) => handleSticker(sock, jid, message),
+  
+  tolivep: ({ sock, jid, message }) => handleLivePhoto(sock, jid, message),
 
-  uptime: ({ sock, jid, message }) => {
-    const u = Math.floor(process.uptime());
-    const h = Math.floor(u / 3600);
-    const m = Math.floor((u % 3600) / 60);
-    const s = u % 60;
-    return reply(sock, jid, message, {
-      text: E.clock + ' Bot ativo ha ' + h + 'h ' + m + 'm ' + s + 's',
-    });
-  },
-
-  info: ({ sock, jid, message }) => sendMessageInfo(sock, jid, message),
-
-  s:       ({ sock, jid, message }) => imageToSticker(sock, message, jid),
-  sticker: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
-  fig:     ({ sock, jid, message }) => imageToSticker(sock, message, jid),
-
-  img:    ({ sock, jid, message }) => stickerToImage(sock, message, jid),
-  toimg:  ({ sock, jid, message }) => stickerToImage(sock, message, jid),
-  imagem: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
-
-  ban:     ({ sock, jid, sender, message }) => handleGroupAction(sock, jid, sender, 'remove', message),
-  promote: ({ sock, jid, sender, message }) => handleGroupAction(sock, jid, sender, 'promote', message),
-  demote:  ({ sock, jid, sender, message }) => handleGroupAction(sock, jid, sender, 'demote', message),
-
-  execute: ({ sock, jid, sender, body, message }) => executeCode(sock, jid, sender, body, message),
-  exec:    ({ sock, jid, sender, body, message }) => executeCode(sock, jid, sender, body, message),
+  play:    ({ sock, jid, sender, body, message }) => handleYtSearch(sock, jid, sender, body, message),
+  yt:      ({ sock, jid, sender, body, message }) => handleYtSearch(sock, jid, sender, body, message),
+  
   eval:    ({ sock, jid, sender, body, message }) => executeCode(sock, jid, sender, body, message),
 };
 
-/* ==================== handler de mensagem ==================== */
+/* ==================== handler principal ==================== */
 async function onMessage(sock, m) {
   if (!m?.message || !m.key?.remoteJid) return;
   const jid = m.key.remoteJid;
-  if (jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
-  if (m.key.id && sentCache.has(m.key.id)) return;
-
-  const ts = Number(m.messageTimestamp);
-  if (ts && Date.now() / 1000 - ts > 90) return;
+  if (jid === 'status@broadcast' || jid.endsWith('@newsletter') || m.key.fromMe) return;
 
   storeMessage(m);
+  const sender = senderOf(m);
+  const content = unwrap(m);
 
-  if (getPollUpdate(m)) {
-    try {
-      await handleMenuPoll(sock, m);
-    } catch (e) {
-      console.error('handleMenuPoll:', e?.stack || e);
-    }
+  // Verifica se eh resposta de Lista
+  const listResponseId = content.listResponseMessage?.singleSelectReply?.selectedRowId 
+                      || content.buttonsResponseMessage?.selectedButtonId 
+                      || content.templateButtonReplyMessage?.selectedId;
+
+  if (listResponseId) {
+    await handleListResponse(sock, jid, sender, m, listResponseId);
     return;
   }
-
-  if (m.key.fromMe) return;
 
   const text = textOf(m);
   if (!text.startsWith(PREFIX)) return;
@@ -561,23 +457,11 @@ async function onMessage(sock, m) {
   const command = (parts.shift() || '').toLowerCase();
   const args = parts;
   const body = args.join(' ');
-  const sender = senderOf(m);
 
   const handler = COMMAND_HANDLERS[command];
-  if (!handler) {
-    await reply(sock, jid, m, {
-      text: E.x + ' Comando nao encontrado. Use ' + PREFIX + 'menu para ver as opcoes.',
-    });
-    return;
-  }
-
-  try {
-    await handler({ sock, jid, sender, message: m, args, body });
-  } catch (error) {
-    console.error('erro no comando ' + PREFIX + command + ':', error?.stack || error);
-    await reply(sock, jid, m, {
-      text: E.x + ' Erro ao processar comando: ' + String(error?.message || error).slice(0, 100),
-    });
+  if (handler) {
+    try { await handler({ sock, jid, sender, message: m, args, body }); }
+    catch (e) { console.error(e); }
   }
 }
 
@@ -586,140 +470,55 @@ async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   let version;
-  try {
-    version = (await fetchLatestBaileysVersion()).version;
-  } catch (e) {
-    console.warn('nao consegui buscar a versao mais recente do WA, usando a padrao:', e?.message);
-  }
+  try { version = (await fetchLatestBaileysVersion()).version; } catch (e) {}
 
   const sock = makeWASocket({
-    ...(version ? { version } : {}),
+    version,
     auth: state,
     logger: makeLogger(),
     browser: Browsers.ubuntu('Chrome'),
     markOnlineOnConnect: false,
-    syncFullHistory: false,
-    generateHighQualityLinkPreview: false,
     getMessage: async (key) => sentCache.get(key.id),
   });
+  
   setActiveSock(sock);
   sock.ev.on('creds.update', saveCreds);
 
-  let reached = false;
-  let closedSeen = false;
-  const watchdog = setTimeout(() => {
-    if (reached) return;
-    console.error(
-      '[watchdog] ' + (WATCHDOG_MS / 1000) + 's sem conseguir falar com o WhatsApp ' +
-      '(hospedagem bloqueando saida? DNS? firewall?). Tentando de novo...'
-    );
-    try { sock.end(new Error('watchdog: sem conexao')); }
-    catch (e) { console.error('sock.end falhou:', e?.message); }
-    setTimeout(() => { if (!closedSeen) boot(); }, 5000);
-  }, WATCHDOG_MS);
-
   let pairingRequested = false;
   const askPairing = async () => {
-    if (pairingRequested || closedSeen || sock.authState.creds.registered) return;
+    if (pairingRequested || sock.authState.creds.registered) return;
     pairingRequested = true;
     try {
       const code = await sock.requestPairingCode(PAIR_NUMBER, PAIR_CODE);
-      const pretty = code.match(/.{1,4}/g).join('-');
-      console.log(
-        '\n==========================================\n' +
-        '   NUMERO: ' + PAIR_NUMBER + '\n' +
-        '   CODIGO DE PAREAMENTO:  ' + pretty + '\n' +
-        '   WhatsApp > Aparelhos conectados > Conectar\n' +
-        '   aparelho > Conectar com numero de telefone\n' +
-        '==========================================\n'
-      );
-    } catch (e) {
-      pairingRequested = false;
-      const short = String(e?.stack || e).split('\n').slice(0, 3).join(' | ');
-      console.error('falha ao pedir o pairing code: ' + short);
-    }
+      console.log('\n\n=== CODIGO DE PAREAMENTO: ' + code.match(/.{1,4}/g).join('-') + ' ===\n\n');
+    } catch (e) { console.error('erro no pairing:', e.message); }
   };
-  if (!sock.authState.creds.registered) setTimeout(askPairing, 8000).unref();
+  if (!sock.authState.creds.registered) setTimeout(askPairing, 8000);
 
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u;
-    if (qr || connection === 'open') {
-      reached = true;
-      clearTimeout(watchdog);
-    }
     if (qr) askPairing();
-    if (connection) console.log('connection.update -> ' + connection);
-
-    if (connection === 'open') {
-      console.log('CONECTADO como ' + sock.user?.id + (sock.user?.lid ? ' (lid ' + sock.user.lid + ')' : ''));
-      console.log('Mande ' + PREFIX + 'menu pra este numero (ou pra voce mesmo, em "Conversar comigo").');
-    }
-
     if (connection === 'close') {
-      closedSeen = true;
-      clearTimeout(watchdog);
-      if (activeSock === sock) setActiveSock(null);
-      const err = lastDisconnect?.error;
-      const code = err?.output?.statusCode;
-      console.error('CONEXAO FECHADA: code=' + code + ' (' + (DisconnectReason[code] ?? 'desconhecido') + ') - ' + err?.message);
-
-      if (code === DisconnectReason.loggedOut) {
-        console.error('Sessao deslogada: apagando a pasta de sessao e pareando de novo.');
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      }
-      if (code === DisconnectReason.connectionReplaced) {
-        console.error('Sessao aberta em OUTRO lugar (440). Nao vou reconectar pra nao brigar com a outra instancia.');
-        return;
-      }
+      const code = lastDisconnect?.error?.output?.statusCode;
+      if (code === DisconnectReason.loggedOut) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
       setTimeout(boot, code === DisconnectReason.restartRequired ? 500 : 3000);
     }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const m of messages) {
-      try {
-        await onMessage(sock, m);
-      } catch (e) {
-        console.error('erro no handler de mensagem:', e?.stack || e);
-      }
+    if (type === 'notify') {
+      for (const m of messages) await onMessage(sock, m);
     }
   });
 }
 
 function boot() {
   start().catch((e) => {
-    console.error('erro ao iniciar:', e?.stack || e);
+    console.error(e);
     setTimeout(boot, 5000);
   });
 }
 
-/* ==================== HTTP health (opcional) ==================== */
-if (process.env.PORT) {
-  http
-    .createServer((_q, r) => r.end('bot ok'))
-    .listen(process.env.PORT, () => console.log('http na porta ' + process.env.PORT));
-}
+if (process.env.PORT) http.createServer((_q, r) => r.end('ok')).listen(process.env.PORT);
 
-if (!process.env.BOT_NO_START) boot();
-
-// exportado so pra testes offline
-export {
-  start,
-  boot,
-  onMessage,
-  COMMAND_HANDLERS,
-  sendMenu,
-  handleMenuPoll,
-  imageToSticker,
-  stickerToImage,
-  handleGroupAction,
-  executeCode,
-  sendMessageInfo,
-  makeLogger,
-  sentCache,
-  messageStore,
-  menuSessions,
-  setActiveSock,
-  PAIR_NUMBER,
-};
+loadLibs().then(() => boot()); // forca load lazy antes de conectar
