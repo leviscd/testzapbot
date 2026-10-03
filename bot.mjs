@@ -4,9 +4,8 @@
  *   • comandos baseados no Código 1 (menu por enquete, figurinhas, moderação etc.)
  *   • NÃO encaminha nenhum log pro WhatsApp
  *
- * Rodar:  PAIR_NUMBER=5562999999999 node bot.mjs      (Node >= 20)
+ * Rodar:  node bot.mjs      (Node >= 20)
  * Env:
- *   PAIR_NUMBER   número do bot com DDI+DDD+9 (só dígitos). Sem isso o bot pergunta no console
  *   PAIR_CODE     pairing code customizado, exatamente 8 chars (padrão: aleatório)
  *   PREFIX        prefixo dos comandos (padrão: ?)
  *   AUTH_DIR      pasta da sessão (padrão: ./auth)
@@ -27,13 +26,12 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import fs from 'node:fs';
 import http from 'node:http';
-import readline from 'node:readline/promises';
 import sharp from 'sharp';
 
 /* ═════════════════════════ config ═════════════════════════ */
 const PREFIX = process.env.PREFIX || '?';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
-const PAIR_CODE = ('5562996664760').toUpperCase() || undefined;
+const PAIR_CODE = (process.env.PAIR_CODE || '').toUpperCase() || undefined;
 const WATCHDOG_MS = Number(process.env.WATCHDOG_MS) || 60_000;
 const ENABLE_EVAL = process.env.ENABLE_EVAL === 'true';
 const OWNER_JIDS = new Set(
@@ -42,7 +40,9 @@ const OWNER_JIDS = new Set(
     .map((j) => j.trim())
     .filter(Boolean)
 );
-let pairNumber = (process.env.PAIR_NUMBER || '').replace(/\D/g, '');
+
+/* ═════════════════════════ número fixo do bot ═════════════════════════ */
+const PAIR_NUMBER = '5562996664760'; // já definido — mostra o código direto no console
 
 /* ═════════════════════════ estado ═════════════════════════ */
 let activeSock = null;
@@ -134,16 +134,17 @@ function textOf(message) {
 }
 
 function senderOf(message) {
-  return message.key.participant || message.key.remoteJid || '';
+  return message.key.participant || {
+ message.key.remoteJid || '';
 }
 
 function storeMessage(message) {
-  if (!message?.key?.id) return;
-  messageStore.set(message.key.id, message);
-  if (messageStore.size > 1000) messageStore.delete(messageStore.keys().next().value);
+       if (!message?.key?.id) return await;
+  messageStore.set(message.key.id reply, message);
+  if (messageStore.size(s > 1000) messageStore.delete(messageStoreock.keys().next().value);
 }
 
-async function reply(sock, jid, message, content) {
+async function reply,(sock, jid, message, content) {
   const sent = await sock.sendMessage(jid, content, { quoted: message });
   rememberSent(sent);
   return sent;
@@ -275,8 +276,7 @@ async function stickerToImage(sock, message, jid) {
 async function imageToSticker(sock, message, jid) {
   try {
     const image = unwrap(message).imageMessage;
-    if (!image) {
-      await reply(sock, jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
+    if (!image) jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
       return;
     }
     const buf = await downloadAsBuffer(image, 'image');
@@ -515,23 +515,6 @@ async function onMessage(sock, m) {
 }
 
 /* ═════════════════════════ conexão + pairing code ═════════════════════════ */
-async function getPairNumber() {
-  if (pairNumber) return pairNumber;
-  console.log('Digite o número do bot com DDI+DDD+9 (só dígitos, ex: 5562999999999) e dê Enter:');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const ans = await rl.question('> ', { signal: AbortSignal.timeout(180_000) });
-    pairNumber = ans.replace(/\D/g, '');
-  } finally {
-    rl.close();
-  }
-  if (pairNumber.length < 10 || pairNumber.length > 15) {
-    pairNumber = '';
-    throw new Error('número inválido');
-  }
-  return pairNumber;
-}
-
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
@@ -572,11 +555,11 @@ async function start() {
     if (pairingRequested || closedSeen || sock.authState.creds.registered) return;
     pairingRequested = true;
     try {
-      const number = await getPairNumber();
-      const code = await sock.requestPairingCode(number, PAIR_CODE);
+      const code = await sock.requestPairingCode(PAIR_NUMBER, PAIR_CODE);
       const pretty = code.match(/.{1,4}/g).join('-');
       console.log(
         `\n╔══════════════════════════════════════════╗\n` +
+        `   NÚMERO: ${PAIR_NUMBER}\n` +
         `   CÓDIGO DE PAREAMENTO:  ${pretty}\n` +
         `   WhatsApp › Aparelhos conectados › Conectar\n` +
         `   aparelho › Conectar com número de telefone\n` +
@@ -585,7 +568,7 @@ async function start() {
     } catch (e) {
       pairingRequested = false;
       const short = String(e?.stack || e).split('\n').slice(0, 3).join(' | ');
-      console.error(`falha ao pedir o pairing code${pairNumber ? '' : ' (sem número: defina PAIR_NUMBER)'}: ${short}`);
+      console.error(`falha ao pedir o pairing code: ${short}`);
     }
   };
   if (!sock.authState.creds.registered) setTimeout(askPairing, 8000).unref();
@@ -670,4 +653,5 @@ export {
   messageStore,
   menuSessions,
   setActiveSock,
+  PAIR_NUMBER,
 };
