@@ -1,0 +1,10 @@
+{
+  "name": "bot-teste-botoes",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "bot.mjs",
+  "scripts": { "start": "node bot.mjs" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "@whiskeysockets/baileys": "7.0.0-rc14" }
+}
