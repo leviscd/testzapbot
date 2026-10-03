@@ -1,8 +1,9 @@
 /**
  * bot.mjs — bot Baileys 7 em um único arquivo
  *   • login por pairing code (8 caracteres)
- *   • comandos baseados no Código 1 (menu por enquete, figurinhas, moderação etc.)
+ *   • comandos do Código 1 (menu por enquete, figurinhas, moderação, etc.)
  *   • NÃO encaminha nenhum log pro WhatsApp
+ *   • sharp carregado sob demanda (não quebra o boot se faltar)
  *
  * Rodar:  node bot.mjs      (Node >= 20)
  * Env:
@@ -26,7 +27,6 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import fs from 'node:fs';
 import http from 'node:http';
-import sharp from 'sharp';
 
 /* ═════════════════════════ config ═════════════════════════ */
 const PREFIX = process.env.PREFIX || '?';
@@ -42,14 +42,14 @@ const OWNER_JIDS = new Set(
 );
 
 /* ═════════════════════════ número fixo do bot ═════════════════════════ */
-const PAIR_NUMBER = '5562996664760'; // já definido — mostra o código direto no console
+const PAIR_NUMBER = '5562996664760'; // mostra o código direto no console
 
 /* ═════════════════════════ estado ═════════════════════════ */
 let activeSock = null;
 const setActiveSock = (s) => { activeSock = s; };
 
-const sentCache = new Map();      // id → message (para o Baileys pedir em retry / eco)
-const messageStore = new Map();   // id → message (para reconstruir a enquete)
+const sentCache = new Map();      // id → message (retry / eco do próprio bot)
+const messageStore = new Map();   // id → message (reconstruir enquete)
 const menuSessions = new Map();   // chave da enquete → sessão do menu
 
 function rememberSent(msg) {
@@ -134,38 +134,63 @@ function textOf(message) {
 }
 
 function senderOf(message) {
-  return message.key.participant || {
- message.key.remoteJid || '';
+  return message.key.participant || message.key.remoteJid || '';
 }
 
 function storeMessage(message) {
-       if (!message?.key?.id) return await;
-  messageStore.set(message.key.id reply, message);
-  if (messageStore.size(s > 1000) messageStore.delete(messageStoreock.keys().next().value);
+  if (!message?.key?.id) return;
+  messageStore.set(message.key.id, message);
+  if (messageStore.size > 1000) messageStore.delete(messageStore.keys().next().value);
 }
 
-async function reply,(sock, jid, message, content) {
+async function reply(sock, jid, message, content) {
   const sent = await sock.sendMessage(jid, content, { quoted: message });
   rememberSent(sent);
   return sent;
 }
 
 async function replyError(sock, jid, message, error) {
-  return reply(sock, jid, message, { text: `❌ Erro: ${error?.message || error}` });
+  return reply(sock, jid, message, { text: `❌ Erro:owner ${error?.message || error}` });
 }
 
-/* ═════════════════════════ textos do menu ═════════════════════════ */
+/* ═════)
+════════════════════ textos  do menu ═════════════════════ execute════ */
 const MENU_OPTIONS = ['📸 Figuras', '👮 Moderação', '🛠️ Utilitários', 'ℹ️ Sobre'];
 
 const MENU_RESPONSES = {
   '📸 Figuras': () =>
-    `*🖼️ MENU FIGURAS*\n\n${PREFIX}s - Responda uma figurinha para converter em imagem\n${PREFIX}img - Responda uma imagem para converter em figurinha\n${PREFIX}fig - Alias de figurinha`,
+    `*🖼️ MENU FIGURAS*\n\n` +
+    `${PREFIX}s     - Responda uma imagem para converter em figurinha\n` +
+    `${PREFIX}sticker - Alias de ${PREFIX}s\n` +
+    `${PREFIX}fig   - Alias de ${PREFIX}s\n` +
+    `${PREFIX}img   - Responda uma figurinha para converter em imagem\n` +
+    `${PREFIX}toimg - Alias de ${PREFIX}img\n` +
+    `${PREFIX}imagem - Alias de ${PREFIX}img`,
+
   '👮 Moderação': () =>
-    `*👮 MENU MODERAÇÃO* (Apenas admins)\n\n${PREFIX}ban @user - Remove um membro\n${PREFIX}promote @user - Promove a administrador\n${PREFIX}demote @user - Remove de administrador`,
+    `*👮 MENU MODERAÇÃO* (apenas admins do grupo)\n\n` +
+    `${PREFIX}ban @user     - Remove um membro do grupo\n` +
+    `${PREFIX}promote @user - Promove um membro a administrador\n` +
+    `${PREFIX}demote @user  - Remove um membro de administrador`,
+
   '🛠️ Utilitários': () =>
-    `*🛠️ MENU UTILITÁRIOS*\n\n${PREFIX}ping - Verifica se o bot está online\n${PREFIX}uptime - Mostra tempo de atividade\n${PREFIX}info - Informações da mensagem`,
+    `*🛠️ MENU UTILITÁRIOS*\n\n` +
+    `${PREFIX}menu   - Mostra este menu\n` +
+    `${PREFIX}help   - Alias de ${PREFIX}menu\n` +
+    `${PREFIX}ping   - Verifica se o bot está online\n` +
+    `${PREFIX}uptime - Mostra o tempo de atividade\n` +
+    `${PREFIX}info   - Informações da mensagem respondida\n` +
+    `${PREFIX}execute <code> - Executa JS (owner, se habilitado)\n` +
+    `${PREFIX}exec   - Alias de ${PREFIX}execute\n` +
+    `${PREFIX}eval   - Alias de ${PREFIX}execute`,
+
   'ℹ️ Sobre': () =>
-    `*ℹ️ SOBRE O BOT*\n\n🤖 SyntraxBot v1.1\nBot de WhatsApp usando Baileys\n👥 Suporte a grupos e privados\n⚡ Comandos: ${PREFIX}menu\n\nPrefix: ${PREFIX}`,
+    `*ℹ️ SOBRE O BOT*\n\n` +
+    `🤖 SyntraxBot v1.1\n` +
+    `Bot de WhatsApp usando Baileys\n` +
+    `👥 Suporte a grupos e privados\n` +
+    `⚡ Comandos: ${PREFIX}menu\n\n` +
+    `Prefix: ${PREFIX}`,
 };
 
 const GROUP_ACTION_LABELS = {
@@ -249,6 +274,23 @@ async function handleMenuPoll(sock, message) {
   return true;
 }
 
+/* ═════════════════════════ sharp (lazy) ═════════════════════════ */
+let sharpPromise = null;
+function getSharp() {
+  if (!sharpPromise) {
+    sharpPromise = import('sharp')
+      .then((m) => m.default || m)
+      .catch((e) => {
+        sharpPromise = null; // permite tentar de novo depois
+        throw new Error(
+          'sharp não está disponível neste ambiente — adicione "sharp" nas dependências. Detalhe: ' +
+            (e?.message || e)
+        );
+      });
+  }
+  return sharpPromise;
+}
+
 /* ═════════════════════════ conversão de mídia ═════════════════════════ */
 async function downloadAsBuffer(mediaMessage, mediaType) {
   const stream = await downloadContentFromMessage(mediaMessage, mediaType);
@@ -264,6 +306,7 @@ async function stickerToImage(sock, message, jid) {
       await reply(sock, jid, message, { text: `Responda uma figurinha com ${PREFIX}img` });
       return;
     }
+    const sharp = await getSharp();
     const buf = await downloadAsBuffer(sticker, 'image');
     const image = await sharp(buf).png().toBuffer();
     await reply(sock, jid, message, { image, caption: '🖼️ Sua imagem' });
@@ -276,9 +319,11 @@ async function stickerToImage(sock, message, jid) {
 async function imageToSticker(sock, message, jid) {
   try {
     const image = unwrap(message).imageMessage;
-    if (!image) jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
+    if (!image) {
+      await reply(sock, jid, message, { text: `Responda uma imagem com ${PREFIX}s` });
       return;
     }
+    const sharp = await getSharp();
     const buf = await downloadAsBuffer(image, 'image');
     const webp = await sharp(buf)
       .resize(512, 512, { fit: 'cover', withoutEnlargement: false })
@@ -423,9 +468,11 @@ async function executeCode(sock, jid, sender, code, message) {
 
 /* ═════════════════════════ tabela de comandos ═════════════════════════ */
 const COMMAND_HANDLERS = {
+  // menu
   menu: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
   help: ({ sock, jid, sender }) => sendMenu(sock, jid, sender),
 
+  // utilitários
   ping: ({ sock, jid, message }) => reply(sock, jid, message, { text: '🏓 Pong!' }),
 
   uptime: ({ sock, jid, message }) => {
@@ -438,16 +485,17 @@ const COMMAND_HANDLERS = {
 
   info: ({ sock, jid, message }) => sendMessageInfo(sock, jid, message),
 
-  // "s"/"fig"/"sticker" → imagem → figurinha
+  // figuras: imagem → figurinha
   s: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
   sticker: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
   fig: ({ sock, jid, message }) => imageToSticker(sock, message, jid),
 
-  // "img"/"toimg"/"imagem" → figurinha → imagem
+  // figuras: figurinha → imagem
   img: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
   toimg: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
   imagem: ({ sock, jid, message }) => stickerToImage(sock, message, jid),
 
+  // moderação (grupo)
   ban: ({ sock, jid, sender, message }) =>
     handleGroupAction(sock, jid, sender, 'remove', message),
   promote: ({ sock, jid, sender, message }) =>
@@ -455,7 +503,7 @@ const COMMAND_HANDLERS = {
   demote: ({ sock, jid, sender, message }) =>
     handleGroupAction(sock, jid, sender, 'demote', message),
 
-  execute: ({ sock, jid, sender, body, message }) =>
+  // execução (: ({ sock, jid, sender, body, message }) =>
     executeCode(sock, jid, sender, body, message),
   exec: ({ sock, jid, sender, body, message }) =>
     executeCode(sock, jid, sender, body, message),
@@ -475,7 +523,7 @@ async function onMessage(sock, m) {
 
   storeMessage(m);
 
-  // Enquete: tratamos ANTES de descartar fromMe, porque o voto chega como recebido
+  // Enquete: tratamos ANTES de descartar fromMe (o voto chega como recebido)
   if (getPollUpdate(m)) {
     try {
       await handleMenuPoll(sock, m);
@@ -544,9 +592,10 @@ async function start() {
   const watchdog = setTimeout(() => {
     if (reached) return;
     console.error(
-      `⏱ ${WATCHDOG_MS / 1000}s sem conseguir falar com o WhatsApp (hospedagem bloqueando saída? DNS? firewall?). Tentando de novo…`
+      `[watchdog] ${WATCHDOG_MS / 1000}s sem conseguir falar com o WhatsApp (hospedagem bloqueando saida? DNS? firewall?). Tentando de novo...`
     );
-    try { sock.end(new Error('watchdog: sem conexão')); } catch (e) { console.error('sock.end falhou:', e?.message); }
+    try { sock.end(new Error('watchdog: sem conexao')); }
+    catch (e) { console.error('sock.end falhou:', e?.message); }
     setTimeout(() => { if (!closedSeen) boot(); }, 5000);
   }, WATCHDOG_MS);
 
@@ -558,12 +607,12 @@ async function start() {
       const code = await sock.requestPairingCode(PAIR_NUMBER, PAIR_CODE);
       const pretty = code.match(/.{1,4}/g).join('-');
       console.log(
-        `\n╔══════════════════════════════════════════╗\n` +
-        `   NÚMERO: ${PAIR_NUMBER}\n` +
-        `   CÓDIGO DE PAREAMENTO:  ${pretty}\n` +
-        `   WhatsApp › Aparelhos conectados › Conectar\n` +
-        `   aparelho › Conectar com número de telefone\n` +
-        `╚══════════════════════════════════════════╝\n`
+        `\n==========================================\n` +
+        `   NUMERO: ${PAIR_NUMBER}\n` +
+        `   CODIGO DE PAREAMENTO:  ${pretty}\n` +
+        `   WhatsApp > Aparelhos conectados > Conectar\n` +
+        `   aparelho > Conectar com numero de telefone\n` +
+        `==========================================\n`
       );
     } catch (e) {
       pairingRequested = false;
@@ -580,11 +629,11 @@ async function start() {
       clearTimeout(watchdog);
     }
     if (qr) askPairing();
-    if (connection) console.log(`connection.update → ${connection}`);
+    if (connection) console.log(`connection.update -> ${connection}`);
 
     if (connection === 'open') {
-      console.log(`✅ Conectado como ${sock.user?.id}${sock.user?.lid ? ` (lid ${sock.user.lid})` : ''}`);
-      console.log(`Mande ${PREFIX}menu pra este número (ou pra você mesmo, em "Conversar comigo").`);
+      console.log(`CONECTADO como ${sock.user?.id}${sock.user?.lid ? ` (lid ${sock.user.lid})` : ''}`);
+      console.log(`Mande ${PREFIX}menu pra este numero (ou pra voce mesmo, em "Conversar comigo").`);
     }
 
     if (connection === 'close') {
@@ -593,14 +642,14 @@ async function start() {
       if (activeSock === sock) setActiveSock(null);
       const err = lastDisconnect?.error;
       const code = err?.output?.statusCode;
-      console.error(`❌ conexão fechada: code=${code} (${DisconnectReason[code] ?? 'desconhecido'}) — ${err?.message}`);
+      console.error(`CONEXAO FECHADA: code=${code} (${DisconnectReason[code] ?? 'desconhecido'}) — ${err?.message}`);
 
       if (code === DisconnectReason.loggedOut) {
-        console.error('Sessão deslogada: apagando a pasta de sessão e pareando de novo.');
+        console.error('Sessao deslogada: apagando a pasta de sessao e pareando de novo.');
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
       }
       if (code === DisconnectReason.connectionReplaced) {
-        console.error('Sessão aberta em OUTRO lugar (440). Não vou reconectar pra não brigar com a outra instância.');
+        console.error('Sessao aberta em OUTRO lugar (440). Nao vou reconectar pra nao brigar com a outra instancia.');
         return;
       }
       setTimeout(boot, code === DisconnectReason.restartRequired ? 500 : 3000);
