@@ -33,7 +33,7 @@ import sharp from 'sharp';
 /* ═════════════════════════ config ═════════════════════════ */
 const PREFIX = process.env.PREFIX || '?';
 const AUTH_DIR = process.env.AUTH_DIR || './auth';
-const PAIR_CODE = (process.env.PAIR_CODE || '5562996664760').toUpperCase() || undefined;
+const PAIR_CODE = ('5562996664760').toUpperCase() || undefined;
 const WATCHDOG_MS = Number(process.env.WATCHDOG_MS) || 60_000;
 const ENABLE_EVAL = process.env.ENABLE_EVAL === 'true';
 const OWNER_JIDS = new Set(
